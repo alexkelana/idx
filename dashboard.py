@@ -1,7 +1,9 @@
 """
 IDX Master Screener AI — Streamlit Dashboard
-- Jalankan semua (AI adaptive) atau per versi (V2/V3/V4/V5)
+- Jalankan AI adaptive atau per versi (V2/V3/V4/V5)
 - Tab hasil: Klasik vs SMC
+- Kolom Ticker di-freeze (sebagai index)
+- width='stretch' (ganti use_container_width yang deprecated)
 """
 
 import streamlit as st
@@ -58,11 +60,10 @@ mode = st.sidebar.radio(
     index=0,
 )
 
-run_button = st.sidebar.button("▶️ JALANKAN", use_container_width=True, type="primary")
+run_button = st.sidebar.button("▶️ JALANKAN", width="stretch", type="primary")
 
 
 def capture_run(fn, *args, **kwargs):
-    """Jalankan fungsi sambil tangkap print ke string."""
     old_stdout = sys.stdout
     buf = io.StringIO()
     sys.stdout = buf
@@ -152,13 +153,11 @@ st.subheader("📊 Hasil Screener")
 
 
 def find_latest_file(group: str):
-    """Cari file report terbaru untuk 'klasik' atau 'smc'."""
     patterns = [
         f"idx_master_report_{group}_*.csv",
         f"idx_master_report_{group.upper()}_*.csv",
         f"*_{group}_*.csv",
     ]
-    # Fallback nama lama
     if group == "klasik":
         patterns += ["idx_master_report_20*.csv"]
     if group == "smc":
@@ -175,7 +174,6 @@ def find_latest_file(group: str):
         for pat in patterns:
             files.extend(glob.glob(os.path.join(d, pat)))
 
-    # Hindari ambil file smc saat cari klasik
     if group == "klasik":
         files = [f for f in files if "smc" not in os.path.basename(f).lower()]
     if group == "smc":
@@ -184,6 +182,26 @@ def find_latest_file(group: str):
     if not files:
         return None
     return max(files, key=os.path.getmtime)
+
+
+def show_dataframe(df: pd.DataFrame):
+    """Tampilkan tabel; kolom Ticker di-freeze sebagai index."""
+    if df is None or df.empty:
+        st.warning("Data kosong.")
+        return
+
+    df = df.copy()
+
+    if "Ticker" in df.columns:
+        df = df.drop_duplicates(subset=["Ticker"], keep="first")
+        df = df.set_index("Ticker")
+
+    st.dataframe(
+        df,
+        width="stretch",
+        height=480,
+    )
+    st.caption(f"Total: {len(df)} baris • Kolom Ticker di-freeze di kiri")
 
 
 klasik_file = find_latest_file("klasik")
@@ -201,11 +219,7 @@ with tab1:
         st.caption(f"`{os.path.basename(klasik_file)}` • {mtime.strftime('%Y-%m-%d %H:%M')}")
         try:
             df = pd.read_csv(klasik_file)
-            if not df.empty:
-                st.dataframe(df, use_container_width=True, height=480)
-                st.caption(f"Total: {len(df)} baris")
-            else:
-                st.warning("File Klasik kosong.")
+            show_dataframe(df)
         except Exception as e:
             st.error(f"Gagal baca file: {e}")
     else:
@@ -217,11 +231,7 @@ with tab2:
         st.caption(f"`{os.path.basename(smc_file)}` • {mtime.strftime('%Y-%m-%d %H:%M')}")
         try:
             df = pd.read_csv(smc_file)
-            if not df.empty:
-                st.dataframe(df, use_container_width=True, height=480)
-                st.caption(f"Total: {len(df)} baris")
-            else:
-                st.warning("File SMC kosong.")
+            show_dataframe(df)
         except Exception as e:
             st.error(f"Gagal baca file: {e}")
     else:
@@ -239,7 +249,7 @@ Menganalisa rezim IHSG lalu otomatis menjalankan strategi yang sesuai.
 | **V4** | Order Block SMC | `idx_master_report_smc_*.csv` |
 | **V5** | CHOCH SMC | `idx_master_report_smc_*.csv` |
 
-Gunakan modal & risiko di sidebar. Proses biasanya 1–3 menit per strategi.
+**Tampilan tabel:** kolom **Ticker** di-freeze di kiri (sebagai index).
 """)
 
 st.markdown("---")
