@@ -1,9 +1,9 @@
 """
 IDX Master Screener AI — Streamlit Dashboard
+- Panel rezim IHSG
 - Jalankan AI adaptive atau per versi (V2/V3/V4/V5)
 - Tab hasil: Klasik vs SMC
 - Kolom Ticker di-freeze (sebagai index)
-- width='stretch' (ganti use_container_width yang deprecated)
 """
 
 import streamlit as st
@@ -64,6 +64,7 @@ run_button = st.sidebar.button("▶️ JALANKAN", width="stretch", type="primary
 
 
 def capture_run(fn, *args, **kwargs):
+    """Jalankan fungsi sambil tangkap print ke string."""
     old_stdout = sys.stdout
     buf = io.StringIO()
     sys.stdout = buf
@@ -112,7 +113,73 @@ def run_ai_adaptive(account_size: float, risk_pct: float):
 
 
 # =====================================================================
-# EKSEKUSI
+# PANEL REZIM IHSG
+# =====================================================================
+st.subheader("📡 Kondisi Pasar IHSG")
+
+col_btn, _ = st.columns([1, 3])
+with col_btn:
+    cek_rezim = st.button("🔍 Cek Rezim Sekarang", width="stretch")
+
+# Auto-load sekali saat pertama buka, atau saat tombol diklik
+if cek_rezim or "ihsg_regime" not in st.session_state:
+    with st.spinner("Mengambil data IHSG..."):
+        try:
+            import master_screener_ai
+            result = master_screener_ai.analyze_ihsg_regime()
+            st.session_state["ihsg_regime"] = result
+        except Exception as e:
+            st.session_state["ihsg_regime"] = {
+                "regime": "UNKNOWN",
+                "reason": [str(e)],
+                "strategies": [],
+                "last_close": None,
+            }
+
+reg = st.session_state.get("ihsg_regime", {})
+regime = reg.get("regime", "UNKNOWN")
+reasons = reg.get("reason", []) or []
+strategies = reg.get("strategies", []) or []
+last_close = reg.get("last_close")
+
+# Badge warna
+if "BULLISH" in str(regime):
+    st.success(f"**Rezim: {regime}**")
+elif "BEARISH" in str(regime):
+    st.error(f"**Rezim: {regime}**")
+elif "SIDEWAYS" in str(regime):
+    st.warning(f"**Rezim: {regime}**")
+else:
+    st.info(f"**Rezim: {regime}**")
+
+meta_cols = st.columns(4)
+with meta_cols[0]:
+    if last_close:
+        st.metric("IHSG", f"{last_close:,.2f}")
+with meta_cols[1]:
+    ma20 = reg.get("ma20")
+    if ma20:
+        st.metric("MA20", f"{ma20:,.0f}")
+with meta_cols[2]:
+    ma50 = reg.get("ma50")
+    if ma50:
+        st.metric("MA50", f"{ma50:,.0f}")
+with meta_cols[3]:
+    ma100 = reg.get("ma100")
+    if ma100:
+        st.metric("MA100", f"{ma100:,.0f}")
+
+if reasons:
+    for r in reasons:
+        st.markdown(f"- {r}")
+
+if strategies:
+    st.markdown(f"**Strategi disarankan:** `{', '.join(strategies)}`")
+
+st.markdown("---")
+
+# =====================================================================
+# EKSEKUSI SCREENER
 # =====================================================================
 if run_button:
     user_params = {
@@ -124,6 +191,12 @@ if run_button:
     with st.spinner(f"Menjalankan {label}... Mohon tunggu (1–3 menit)."):
         if mode.startswith("🤖"):
             success, err, log = capture_run(run_ai_adaptive, account_size, risk_pct)
+            # Refresh rezim setelah AI adaptive (karena orchestrator menghitung ulang)
+            try:
+                import master_screener_ai
+                st.session_state["ihsg_regime"] = master_screener_ai.analyze_ihsg_regime()
+            except Exception:
+                pass
         elif mode.startswith("V2"):
             success, err, log = capture_run(run_v2, user_params)
         elif mode.startswith("V3"):
@@ -144,15 +217,14 @@ if run_button:
     with st.expander("📋 Log Terminal", expanded=not success):
         st.text(log if log.strip() else "(Tidak ada output)")
 
-st.markdown("---")
-
 # =====================================================================
-# HASIL
+# HASIL SCREENER
 # =====================================================================
 st.subheader("📊 Hasil Screener")
 
 
 def find_latest_file(group: str):
+    """Cari file report terbaru untuk 'klasik' atau 'smc'."""
     patterns = [
         f"idx_master_report_{group}_*.csv",
         f"idx_master_report_{group.upper()}_*.csv",
@@ -191,16 +263,11 @@ def show_dataframe(df: pd.DataFrame):
         return
 
     df = df.copy()
-
     if "Ticker" in df.columns:
         df = df.drop_duplicates(subset=["Ticker"], keep="first")
         df = df.set_index("Ticker")
 
-    st.dataframe(
-        df,
-        width="stretch",
-        height=480,
-    )
+    st.dataframe(df, width="stretch", height=480)
     st.caption(f"Total: {len(df)} baris • Kolom Ticker di-freeze di kiri")
 
 
@@ -249,7 +316,9 @@ Menganalisa rezim IHSG lalu otomatis menjalankan strategi yang sesuai.
 | **V4** | Order Block SMC | `idx_master_report_smc_*.csv` |
 | **V5** | CHOCH SMC | `idx_master_report_smc_*.csv` |
 
-**Tampilan tabel:** kolom **Ticker** di-freeze di kiri (sebagai index).
+**Panel atas:** rezim IHSG (BULLISH / PULLBACK / SIDEWAYS / BEARISH) + MA + strategi disarankan.
+
+**Tabel:** kolom **Ticker** di-freeze di kiri.
 """)
 
 st.markdown("---")
