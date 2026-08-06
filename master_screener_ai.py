@@ -47,8 +47,20 @@ except ImportError:
         return f"idx_master_report_{group}_{today}.csv"
 
 
-def analyze_ihsg_regime(lookback_days: int = 150) -> dict:
-    """Menganalisis rezim pasar IHSG."""
+def analyze_ihsg_regime(lookback_days: int = 180) -> dict:
+    """
+    Menganalisis rezim pasar IHSG secara lebih realistis.
+
+    Rezim:
+      - BULLISH_STRONG   → uptrend kuat, dekat high
+      - BULLISH_PULLBACK → uptrend masih valid, sedang koreksi
+      - SIDEWAYS         → tanpa arah jelas / rotasi
+      - BEARISH_WEAK     → tekanan jual, belum ekstrem
+      - BEARISH_STRONG   → downtrend / dekat low
+      - UNKNOWN          → data tidak cukup
+
+    Strategi yang direkomendasikan menyesuaikan rezim di atas.
+    """
     print("\n" + "=" * 80)
     print("MENGANALISA REZIM PASAR IHSG SAAT INI (^JKSE)")
     print("=" * 80)
@@ -80,54 +92,130 @@ def analyze_ihsg_regime(lookback_days: int = 150) -> dict:
 
     close = df["Close"].dropna()
     if len(close) < 100:
-        return {"regime": "UNKNOWN", "reason": "Data tidak cukup.", "strategies": []}
+        return {"regime": "UNKNOWN", "reason": "Data tidak cukup (<100 bar).", "strategies": []}
 
-    ma20 = close.rolling(20).mean().iloc[-1]
-    ma50 = close.rolling(50).mean().iloc[-1]
-    ma100 = close.rolling(100).mean().iloc[-1]
-    last_close = close.iloc[-1]
+    # --- Moving Averages ---
+    ma20 = close.rolling(20).mean()
+    ma50 = close.rolling(50).mean()
+    ma100 = close.rolling(100).mean()
 
-    if pd.isna(ma20) or pd.isna(ma50) or pd.isna(ma100):
+    last_close = float(close.iloc[-1])
+    last_ma20 = float(ma20.iloc[-1])
+    last_ma50 = float(ma50.iloc[-1])
+    last_ma100 = float(ma100.iloc[-1])
+
+    if any(pd.isna(x) for x in [last_ma20, last_ma50, last_ma100]):
         return {"regime": "UNKNOWN", "reason": "MA mengandung NaN.", "strategies": []}
 
-    recent_20d = close.tail(20)
-    high_20d = recent_20d.max()
-    low_20d = recent_20d.min()
-    dist_to_high_pct = (high_20d - last_close) / last_close * 100
-    dist_to_low_pct = (last_close - low_20d) / low_20d * 100
+    # Slope MA (bandingkan dengan 5 bar lalu)
+    ma20_prev = float(ma20.iloc[-6]) if len(ma20) >= 6 else last_ma20
+    ma50_prev = float(ma50.iloc[-6]) if len(ma50) >= 6 else last_ma50
+    ma20_rising = last_ma20 > ma20_prev
+    ma50_rising = last_ma50 > ma50_prev
+    ma20_falling = last_ma20 < ma20_prev
+    ma50_falling = last_ma50 < ma50_prev
 
-    regime = "SIDEWAYS / PULLBACK"
+    # High / Low
+    high_20 = float(close.tail(20).max())
+    low_20 = float(close.tail(20).min())
+    high_60 = float(close.tail(60).max()) if len(close) >= 60 else high_20
+    low_60 = float(close.tail(60).min()) if len(close) >= 60 else low_20
+
+    dist_to_high_20 = (high_20 - last_close) / last_close * 100
+    dist_to_low_20 = (last_close - low_20) / low_20 * 100
+    dist_to_high_60 = (high_60 - last_close) / last_close * 100
+    dist_to_low_60 = (last_close - low_60) / low_60 * 100
+
+    # Lebar range 20 hari (untuk deteksi sideways)
+    range_20_pct = (high_20 - low_20) / last_close * 100
+
+    # Struktur MA
+    bullish_stack = last_close > last_ma20 > last_ma50 > last_ma100
+    bearish_stack = last_close < last_ma20 < last_ma50  # MA100 opsional
+    above_ma50 = last_close > last_ma50
+    above_ma100 = last_close > last_ma100
+    below_ma50 = last_close < last_ma50
+    below_ma20 = last_close < last_ma20
+
+    # =================================================================
+    # DECISION ENGINE
+    # =================================================================
+    regime = "SIDEWAYS"
     reason = []
-    recommended_strategy = []
+    strategies = []
 
-    if last_close > ma20 and ma20 > ma50 and ma50 > ma100 and dist_to_high_pct < 2.0:
-        regime = "BULLISH"
-        reason.append("IHSG berada dalam uptrend kuat (Close > MA20 > MA50 > MA100).")
-        reason.append("Harga menempel di area Resistance tertinggi bulanan.")
-        recommended_strategy = ["V2"]
-    elif last_close < ma20 and last_close < ma50 and dist_to_low_pct < 2.0:
-        regime = "BEARISH"
-        reason.append("IHSG berada dalam tekanan jual / downtrend (Close < MA20 & MA50).")
-        reason.append("Harga berada di dekat titik terendah bulanan.")
-        recommended_strategy = ["V5"]
+    # 1) BULLISH STRONG
+    #    Uptrend sempurna + momentum naik + tidak jauh dari high
+    if bullish_stack and ma20_rising and ma50_rising and dist_to_high_20 <= 5.0:
+        regime = "BULLISH_STRONG"
+        reason.append("Uptrend kuat: Close > MA20 > MA50 > MA100.")
+        reason.append("MA20 & MA50 sedang naik (momentum positif).")
+        reason.append(f"Harga dekat high 20 hari (jarak {dist_to_high_20:.1f}%).")
+        strategies = ["V2"]
+
+    # 2) BULLISH PULLBACK
+    #    Struktur jangka menengah masih naik, tapi harga koreksi di bawah MA20
+    elif above_ma50 and above_ma100 and (last_ma50 > last_ma100) and below_ma20:
+        regime = "BULLISH_PULLBACK"
+        reason.append("Struktur menengah masih bullish (Close > MA50 > MA100).")
+        reason.append("Harga sedang pullback di bawah MA20 (koreksi wajar).")
+        if ma50_rising:
+            reason.append("MA50 masih naik — pullback dalam uptrend.")
+        strategies = ["V3"]  # Retest / buy on weakness; V2 opsional tidak dipaksa
+
+    # 3) BEARISH STRONG
+    #    Di bawah MA pendek & menengah + dekat low + momentum turun
+    elif below_ma20 and below_ma50 and (ma20_falling or ma50_falling) and dist_to_low_20 <= 5.0:
+        regime = "BEARISH_STRONG"
+        reason.append("Downtrend: Close < MA20 & MA50.")
+        reason.append("MA sedang turun (momentum negatif).")
+        reason.append(f"Harga dekat low 20 hari (jarak {dist_to_low_20:.1f}%).")
+        strategies = ["V5"]
+
+    # 4) BEARISH WEAK
+    #    Di bawah MA50 tapi belum ekstrem di low
+    elif below_ma50 and below_ma20:
+        regime = "BEARISH_WEAK"
+        reason.append("Harga di bawah MA20 & MA50 (tekanan jual).")
+        reason.append("Belum di zona low ekstrem — downtrend / distribusi.")
+        if dist_to_low_60 < 8.0:
+            reason.append(f"Mendekati low 60 hari (jarak {dist_to_low_60:.1f}%).")
+        strategies = ["V5"]  # tetap prioritaskan bottom-fishing / hati-hati
+
+    # 5) SIDEWAYS
+    #    Range sempit, atau MA saling silang tanpa arah jelas
     else:
-        regime = "SIDEWAYS / PULLBACK"
-        if last_close > ma50 and last_close < ma20:
-            reason.append("IHSG sedang mengalami koreksi wajar (Pullback ke MA50).")
+        regime = "SIDEWAYS"
+        if range_20_pct <= 6.0:
+            reason.append(f"Range 20 hari sempit ({range_20_pct:.1f}%) — konsolidasi.")
+        elif above_ma50 and not bullish_stack:
+            reason.append("Di atas MA50 tapi struktur MA belum rapi — rotasi / mixed.")
+        elif below_ma50 and not below_ma20:
+            reason.append("Di sekitar MA — tanpa tren ekstrem.")
         else:
-            reason.append("IHSG bergerak tanpa tren yang ekstrem (Rotasi Sektor).")
-        recommended_strategy = ["V3", "V4"]
+            reason.append("Tidak ada tren bullish/bearish yang jelas (rotasi sektor).")
+        strategies = ["V3", "V4"]
 
+    # --- Output terminal ---
     print(f"Index Terakhir : {last_close:,.2f}")
-    print(f"Status MA      : MA20={ma20:,.0f} | MA50={ma50:,.0f} | MA100={ma100:,.0f}")
+    print(f"Status MA      : MA20={last_ma20:,.0f} | MA50={last_ma50:,.0f} | MA100={last_ma100:,.0f}")
+    print(f"Slope MA       : MA20={'naik' if ma20_rising else 'turun'} | MA50={'naik' if ma50_rising else 'turun'}")
+    print(f"Dist High20/60 : {dist_to_high_20:.1f}% / {dist_to_high_60:.1f}%")
+    print(f"Dist Low20/60  : {dist_to_low_20:.1f}% / {dist_to_low_60:.1f}%")
+    print(f"Range 20 hari  : {range_20_pct:.1f}%")
     print(f"Rezim Pasar    : ** {regime} **")
     for r in reason:
         print(f"  - {r}")
+    print(f"Strategi       : {', '.join(strategies)}")
 
     return {
         "regime": regime,
-        "strategies": recommended_strategy,
-        "last_close": float(last_close),
+        "strategies": strategies,
+        "last_close": last_close,
+        "ma20": last_ma20,
+        "ma50": last_ma50,
+        "ma100": last_ma100,
+        "reason": reason,
     }
 
 
