@@ -1,67 +1,41 @@
 """
 IDX PULLBACK & RETEST SCREENER — v3 (Buy on Weakness setelah Breakout)
-[FIXED] atr NameError, params ke scanner, MultiIndex, min RR, data guard.
+======================================================================
+[FIXED]
+- ATR dihitung (bug NameError diperbaiki)
+- Weekly regime sedikit dilonggarkan
+- breakout_lookback 15 hari
+- Zona Fibo 23.6% – 61.8%
+- Volume koreksi hanya mempengaruhi score (bukan hard reject)
 """
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import requests
 import yfinance as yf
 from datetime import datetime, timedelta
 from idx_liquidity_scanner import IdxLiquidityScanner
 
-def get_lq45_universe() -> list:
-    url = "https://id.wikipedia.org/wiki/LQ45"
-    fallback_universe = ["BBCA", "BBRI", "BMRI", "BBNI", "TLKM", "ASII", "GOTO", "AMMN"]
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=10)
-        tables = pd.read_html(response.text)
-        for df in tables:
-            cols = [str(c).lower() for c in df.columns]
-            if 'kode' in cols or 'simbol' in cols or 'ticker' in cols:
-                target_col = next((c for c in df.columns if str(c).lower() in ['kode', 'simbol', 'ticker']), None)
-                if target_col:
-                    tickers = df[target_col].dropna().astype(str).tolist()
-                    return [t.upper().strip() for t in tickers if len(t.strip()) == 4 and t.isalpha()]
-    except Exception:
-        pass
-    return fallback_universe
-
-def get_dynamic_liquidity_universe(params: dict = None) -> list:          # [FIX] Terima params
-    print("=" * 60)
-    print("TAHAP 1: PRE-SCREENER (MEMINDAI SELURUH PASAR)")
-    print("=" * 60)
-    params = params or {}
-    scanner = IdxLiquidityScanner(
-        min_avg_value_rp=params.get("min_avg_value_traded", 10_000_000_000),
-        min_avg_volume=params.get("min_avg_volume", 1_000_000),
-        lookback_days=20,
-        max_workers=15
-    )
-    liquid_universe = scanner.get_liquid_universe()
-    print("=" * 60)
-    print("TAHAP 2: DEEP TECHNICAL ANALYSIS (RETEST V3)")
-    print("=" * 60)
-    return liquid_universe
-
+# =========================================================================
+# PARAMETER
+# =========================================================================
 PARAMS = {
     "lookback_days": 350,
-    "breakout_lookback": 10,
-    "breakout_vol_ratio": 1.5,
+    "breakout_lookback": 15,       # [FIX] sebelumnya 10
+    "breakout_vol_ratio": 1.4,     # [FIX] sedikit longgar dari 1.5
     "adx_period": 14,
     "roc_period": 10,
     "stop_buffer_pct": 2.0,
-    "min_rr": 1.2,                          # [FIX] Minimum RR
-    "account_size": 5_000_000,
+    "account_size": 50_000_000,
     "risk_per_trade_pct": 1.0,
     "lot_size": 100,
-    "min_avg_value_traded": 10_000_000_000,
-    "min_avg_volume": 1_000_000,
+    "min_rr": 1.2,                 # RR minimum
 }
 
+# =========================================================================
+# UTILITAS BEI
+# =========================================================================
 def round_to_idx_tick(price: float) -> int:
     if pd.isna(price) or price <= 0:
         return 0
@@ -69,11 +43,17 @@ def round_to_idx_tick(price: float) -> int:
     if price < 50:
         return int(round(price))
     price = int(round(price, 0))
-    if price < 200: return price
-    elif price < 500: return int(round(price / 2.0) * 2)
-    elif price < 2000: return int(round(price / 5.0) * 5)
-    elif price < 5000: return int(round(price / 10.0) * 10)
-    else: return int(round(price / 25.0) * 25)
+    if price < 200:
+        return price
+    elif price < 500:
+        return int(round(price / 2.0) * 2)
+    elif price < 2000:
+        return int(round(price / 5.0) * 5)
+    elif price < 5000:
+        return int(round(price / 10.0) * 10)
+    else:
+        return int(round(price / 25.0) * 25)
+
 
 def apply_ara_arb_limits(price: float, prev_close: float, is_target: bool) -> float:
     limit = 0.35 if prev_close < 200 else (0.25 if prev_close <= 5000 else 0.20)
@@ -81,27 +61,9 @@ def apply_ara_arb_limits(price: float, prev_close: float, is_target: bool) -> fl
     arb = round_to_idx_tick(prev_close * (1 - limit))
     return min(price, ara) if is_target else max(price, arb)
 
-def compute_adx(df: pd.DataFrame, period: int = 14):
-    high, low, close = df['High'], df['Low'], df['Close']
-    up = high - high.shift(1)
-    down = low.shift(1) - low
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    tr1 = high - low
-    tr2 = abs(high - close.shift(1))
-    tr3 = abs(low - close.shift(1))
-    tr = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1)
-    atr = tr.ewm(alpha=1/period, adjust=False).mean()
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-    adx = dx.ewm(alpha=1/period, adjust=False).mean()
-    return adx, plus_di, minus_di
 
-def compute_roc(series: pd.Series, period: int = 10) -> pd.Series:
-    return series.pct_change(periods=period) * 100
-
-def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:     # [FIX] Fungsi ATR ditambahkan
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """[FIX] ATR yang sebelumnya tidak dihitung."""
     high, low, close = df["High"], df["Low"], df["Close"]
     prev_close = close.shift(1)
     tr = pd.concat([
@@ -111,12 +73,62 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:     # [FIX] Fu
     ], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
+
+def compute_adx(df: pd.DataFrame, period: int = 14):
+    high, low, close = df["High"], df["Low"], df["Close"]
+    up = high - high.shift(1)
+    down = low.shift(1) - low
+
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)
+    adx = dx.ewm(alpha=1 / period, adjust=False).mean()
+    return adx, plus_di, minus_di
+
+
+def compute_roc(series: pd.Series, period: int = 10) -> pd.Series:
+    return series.pct_change(periods=period) * 100
+
+
+# =========================================================================
+# UNIVERSE
+# =========================================================================
+def get_dynamic_liquidity_universe() -> list:
+    print("=" * 60)
+    print("TAHAP 1: PRE-SCREENER LIKUIDITAS")
+    print("=" * 60)
+    scanner = IdxLiquidityScanner(
+        min_avg_value_rp=10_000_000_000,
+        min_avg_volume=1_000_000,
+        lookback_days=20,
+        max_workers=15,
+    )
+    universe = scanner.get_liquid_universe()
+    print("=" * 60)
+    print("TAHAP 2: ANALISA PULLBACK / RETEST (V3)")
+    print("=" * 60)
+    return universe
+
+
+# =========================================================================
+# ANALISA SATU TICKER
+# =========================================================================
 def analyze_ticker(symbol: str, params: dict) -> dict | None:
     ticker = symbol + ".JK"
     try:
         df = yf.download(
             ticker,
-            period=f"{params['lookback_days']}d",
+            period=f"{int(params['lookback_days'])}d",
             interval="1d",
             progress=False,
             auto_adjust=True,
@@ -132,121 +144,169 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         try:
             df.columns = df.columns.get_level_values(0)
         except Exception:
-            df = df.droplevel(-1, axis=1)
+            try:
+                df = df.droplevel(-1, axis=1)
+            except Exception:
+                return None
 
-    if "Close" not in df.columns:
+    need = ["Open", "High", "Low", "Close", "Volume"]
+    if any(c not in df.columns for c in need):
         return None
 
     df = df.dropna()
     if len(df) < 150:
         return None
 
-    # 1. REGIME FILTER (Mingguan)
-    weekly = df.resample('W').agg({
-        'Open': 'first', 'High': 'max', 'Low': 'min',
-        'Close': 'last', 'Volume': 'sum'
+    # ------------------------------------------------------------------
+    # 1. REGIME MINGGUAN (dilonggarkan)
+    #    Lama : Close > MA10w > MA30w AND MA10 naik
+    #    Baru : Close > MA10w AND MA10w >= MA30w * 0.98 (hampir di atas)
+    #           OR (Close > MA10w > MA30w)
+    # ------------------------------------------------------------------
+    weekly = df.resample("W").agg({
+        "Open": "first", "High": "max", "Low": "min",
+        "Close": "last", "Volume": "sum",
     }).dropna()
+
     if len(weekly) < 30:
         return None
 
-    ma10w = weekly['Close'].rolling(10).mean()
-    ma30w = weekly['Close'].rolling(30).mean()
+    ma10w = weekly["Close"].rolling(10).mean()
+    ma30w = weekly["Close"].rolling(30).mean()
 
-    w_close = weekly['Close'].iloc[-1]
-    w_ma10 = ma10w.iloc[-1]
-    w_ma30 = ma30w.iloc[-1]
-    w_ma10_prev = ma10w.iloc[-2]
+    w_close = float(weekly["Close"].iloc[-1])
+    w_ma10 = float(ma10w.iloc[-1])
+    w_ma30 = float(ma30w.iloc[-1])
+    w_ma10_prev = float(ma10w.iloc[-2])
 
-    if pd.isna(w_ma10) or pd.isna(w_ma30):
+    if any(np.isnan(x) for x in [w_ma10, w_ma30, w_ma10_prev]):
         return None
 
-    is_bullish_regime = (w_close > w_ma10 > w_ma30) and (w_ma10 > w_ma10_prev)
+    # [FIX] Regime lebih realistis
+    strict_bull = (w_close > w_ma10 > w_ma30) and (w_ma10 >= w_ma10_prev)
+    soft_bull = (w_close > w_ma10) and (w_ma10 >= w_ma30 * 0.98)
+    is_bullish_regime = strict_bull or soft_bull
+
     if not is_bullish_regime:
         return None
 
-    # 2. CARI BREAKOUT TERKONFIRMASI
+    # ------------------------------------------------------------------
+    # 2. BREAKOUT TERKONFIRMASI
+    # ------------------------------------------------------------------
+    lookback = int(params["breakout_lookback"])
     breakout_idx = -1
-    breakout_price = 0
-    breakout_vol = 0
+    breakout_price = 0.0
+    breakout_vol = 0.0
 
-    for i in range(len(df)-1, max(len(df) - params["breakout_lookback"] - 1, 20), -1):
-        past_high = df['High'].iloc[i-20:i].max()
-        past_vol_avg = df['Volume'].iloc[i-20:i].mean()
-        if df['Close'].iloc[i] > past_high and df['Volume'].iloc[i] >= (past_vol_avg * params["breakout_vol_ratio"]):
+    for i in range(len(df) - 1, max(len(df) - lookback - 1, 20), -1):
+        past_high = float(df["High"].iloc[i - 20:i].max())
+        past_vol_avg = float(df["Volume"].iloc[i - 20:i].mean())
+        if past_vol_avg <= 0:
+            continue
+        if (
+            float(df["Close"].iloc[i]) > past_high
+            and float(df["Volume"].iloc[i]) >= past_vol_avg * params["breakout_vol_ratio"]
+        ):
             breakout_idx = i
             breakout_price = past_high
-            breakout_vol = df['Volume'].iloc[i]
+            breakout_vol = float(df["Volume"].iloc[i])
             break
 
-    if breakout_idx == -1 or breakout_idx >= len(df) - 2:   # [FIX] Minimal 2 candle setelah breakout
+    # Tidak ada breakout, atau breakout hari ini (belum koreksi)
+    if breakout_idx < 0 or breakout_idx >= len(df) - 1:
         return None
 
-    # 3. DETEKSI KOREKSI & FIBONACCI
-    swing_low = df['Low'].iloc[breakout_idx-20:breakout_idx].min()
-    peak = df['High'].iloc[breakout_idx:].max()
+    # ------------------------------------------------------------------
+    # 3. FIBONACCI RETRACE
+    # ------------------------------------------------------------------
+    swing_low = float(df["Low"].iloc[max(0, breakout_idx - 20):breakout_idx].min())
+    peak = float(df["High"].iloc[breakout_idx:].max())
     range_up = peak - swing_low
     if range_up <= 0:
         return None
 
+    # [FIX] Zona lebih lebar: 23.6% – 61.8%
+    fib_236 = peak - 0.236 * range_up
     fib_382 = peak - 0.382 * range_up
     fib_618 = peak - 0.618 * range_up
 
-    last_close = df['Close'].iloc[-1]
-    last_open = df['Open'].iloc[-1]
-    last_vol = df['Volume'].iloc[-1]
-    prev_vol = df['Volume'].iloc[-2]
+    last_close = float(df["Close"].iloc[-1])
+    last_open = float(df["Open"].iloc[-1])
+    last_vol = float(df["Volume"].iloc[-1])
+    prev_vol = float(df["Volume"].iloc[-2])
 
-    in_fibo_zone = fib_618 <= last_close <= fib_382
-    above_breakout_support = last_close >= breakout_price
+    in_fibo_zone = fib_618 <= last_close <= fib_236
+    above_breakout_support = last_close >= breakout_price * 0.995  # toleransi tipis
 
     if not (in_fibo_zone and above_breakout_support):
         return None
 
-    # 4. VALIDASI VOLUME KOREKSI
-    peak_loc = df['High'].iloc[breakout_idx:].idxmax()
+    # ------------------------------------------------------------------
+    # 4. VOLUME KOREKSI (hanya score, bukan reject)
+    # ------------------------------------------------------------------
+    peak_loc = df["High"].iloc[breakout_idx:].idxmax()
     peak_idx_int = df.index.get_loc(peak_loc)
+    if isinstance(peak_idx_int, slice):
+        peak_idx_int = peak_idx_int.start or 0
+
     if peak_idx_int < len(df) - 1:
-        vol_correction_avg = df['Volume'].iloc[peak_idx_int+1:].mean()
+        vol_correction_avg = float(df["Volume"].iloc[peak_idx_int + 1:].mean())
     else:
         vol_correction_avg = last_vol
+
     is_vol_valid = vol_correction_avg < breakout_vol
 
-    # 5. MOMENTUM
+    # ------------------------------------------------------------------
+    # 5. MOMENTUM + ATR [FIX]
+    # ------------------------------------------------------------------
+    atr_series = compute_atr(df, 14)
+    atr = float(atr_series.iloc[-1]) if not pd.isna(atr_series.iloc[-1]) else 0.0
+
     adx, plus_di, minus_di = compute_adx(df, params["adx_period"])
-    curr_adx = adx.iloc[-1]
-    curr_pdi = plus_di.iloc[-1]
-    curr_mdi = minus_di.iloc[-1]
-    roc = compute_roc(df['Close'], params["roc_period"]).iloc[-1]
+    curr_adx = float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 0.0
+    curr_pdi = float(plus_di.iloc[-1]) if not pd.isna(plus_di.iloc[-1]) else 0.0
+    curr_mdi = float(minus_di.iloc[-1]) if not pd.isna(minus_di.iloc[-1]) else 0.0
 
-    # [FIX] Hitung ATR
-    atr = compute_atr(df, 14).iloc[-1]
+    roc_val = compute_roc(df["Close"], params["roc_period"]).iloc[-1]
+    roc = float(roc_val) if not pd.isna(roc_val) else 0.0
 
-    # 6. SINYAL REVERSAL
     is_bullish_candle = last_close > last_open
     is_vol_up = last_vol > prev_vol
     reversal_signal = is_bullish_candle and is_vol_up
 
-    # SCORING
+    # ------------------------------------------------------------------
+    # 6. SCORING
+    # ------------------------------------------------------------------
     score = 20
-    reasons = ["Weekly Bullish"]
+    reasons = ["Weekly Bullish" if strict_bull else "Weekly Soft-Bull"]
+
     if is_vol_valid:
         score += 20
         reasons.append("Vol Koreksi Rendah")
     if curr_adx > 25 and curr_pdi > curr_mdi:
         score += 20
         reasons.append(f"ADX Kuat ({curr_adx:.1f})")
+    elif curr_adx > 18 and curr_pdi > curr_mdi:
+        score += 10
+        reasons.append(f"ADX Moderat ({curr_adx:.1f})")
     if roc > 0:
         score += 10
         reasons.append("ROC Positif")
-    if in_fibo_zone and above_breakout_support:
+    if fib_618 <= last_close <= fib_382:
         score += 15
-        reasons.append("Fibo Golden Zone")
+        reasons.append("Fibo Golden Zone 38-62")
+    elif in_fibo_zone:
+        score += 8
+        reasons.append("Fibo Zone 24-62")
     if reversal_signal:
         score += 15
         reasons.append("Reversal Candle")
 
-    # POSITION PLAN
+    # ------------------------------------------------------------------
+    # 7. POSITION PLAN
+    # ------------------------------------------------------------------
     entry = round_to_idx_tick(last_close)
+
     stop_loss_raw = breakout_price * (1 - params["stop_buffer_pct"] / 100)
     stop_loss = round_to_idx_tick(stop_loss_raw)
     stop_loss = apply_ara_arb_limits(stop_loss, last_close, is_target=False)
@@ -255,14 +315,13 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     if risk_per_share <= 0:
         return None
 
-    target_1 = round_to_idx_tick(peak)
-    target_1 = apply_ara_arb_limits(target_1, last_close, is_target=True)
-    target_2_raw = peak + 0.272 * range_up
-    target_2 = round_to_idx_tick(target_2_raw)
-    target_2 = apply_ara_arb_limits(target_2, last_close, is_target=True)
+    target_1 = apply_ara_arb_limits(round_to_idx_tick(peak), last_close, is_target=True)
+    target_2 = apply_ara_arb_limits(
+        round_to_idx_tick(peak + 0.272 * range_up), last_close, is_target=True
+    )
 
     rr_ratio = (target_1 - entry) / risk_per_share if risk_per_share > 0 else 0
-    if rr_ratio < params.get("min_rr", 1.2):               # [FIX] Filter RR
+    if rr_ratio < params.get("min_rr", 1.2):
         return None
 
     risk_rp = params["account_size"] * params["risk_per_trade_pct"] / 100
@@ -270,8 +329,7 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     shares = lots * params["lot_size"]
     est_capital_used = shares * entry
     est_loss = shares * risk_per_share
-    reward_1 = target_1 - entry
-    est_profit = shares * reward_1
+    est_profit = shares * (target_1 - entry)
 
     return {
         "Ticker": symbol,
@@ -289,27 +347,35 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         "StopLoss": stop_loss,
         "Target1(Peak)": target_1,
         "Target2(Ext)": target_2,
-        "ATR": round(atr, 0) if not np.isnan(atr) else 0,   # [FIX] Sekarang aman
-        "RiskPerShare": risk_per_share,
+        "ATR": round(atr, 0),
+        "RiskPerShare": round(risk_per_share, 0),
         "RR_Ratio": round(rr_ratio, 2),
         "Lots": lots,
         "SuggestedShares": shares,
         "EstCapitalUsed(Rp)": round(est_capital_used, 0),
         "EstLoss(Rp)": round(est_loss, 0),
-        "EstProfit1(Rp)": round(est_profit, 0)
+        "EstProfit1(Rp)": round(est_profit, 0),
+        "Strategy": "V3 (Retest Fibo)",
     }
 
-def run_screener(universe=None, params=None):
-    params = params or PARAMS
-    universe = universe or get_dynamic_liquidity_universe(params)
 
-    print(f"Menjalankan screener v3 (Pullback & Retest) untuk {len(universe)} saham...\n")
+# =========================================================================
+# RUNNER
+# =========================================================================
+def run_screener(universe=None, params=None):
+    params = params or PARAMS.copy()
+    universe = universe or get_dynamic_liquidity_universe()
+
+    print(f"Menjalankan screener V3 (Pullback & Retest) untuk {len(universe)} saham...\n")
     results = []
     for i, sym in enumerate(universe, 1):
         print(f"  [{i}/{len(universe)}] Cek {sym}...", end="\r")
-        row = analyze_ticker(sym, params)
-        if row is not None:
-            results.append(row)
+        try:
+            row = analyze_ticker(sym, params)
+            if row is not None:
+                results.append(row)
+        except Exception:
+            continue
 
     print(" " * 60, end="\r")
 
@@ -319,34 +385,31 @@ def run_screener(universe=None, params=None):
 
     df_result = pd.DataFrame(results).sort_values("Score", ascending=False)
 
-    summary_cols = ["Ticker", "Close", "Score", "BreakoutDay", "VolValid", "Reversal",
-                    "ADX", "ROC(10)", "Entry", "StopLoss", "Target1(Peak)", "RR_Ratio", "Lots"]
-    print("=" * 140)
+    print("=" * 120)
     print(f"IDX PULLBACK & RETEST SCREENER V3 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print("=" * 140)
-    print(df_result[summary_cols].to_string(index=False))
-    print("=" * 140)
+    print("=" * 120)
+    show_cols = [
+        "Ticker", "Close", "Score", "BreakoutDay", "VolValid", "Reversal",
+        "ADX", "ROC(10)", "Entry", "StopLoss", "Target1(Peak)", "RR_Ratio", "Lots",
+    ]
+    show_cols = [c for c in show_cols if c in df_result.columns]
+    print(df_result[show_cols].to_string(index=False))
+    print("=" * 120)
 
-    print("\nRENCANA POSISI — TOP SETUP\n")
-    for _, row in df_result.head(5).iterrows():
-        print(f"--- {row['Ticker']} (Score: {row['Score']}/100) ---")
-        print(f"  Katalis Setup      : {row['Alasan']}")
-        print(f"  Breakout Tanggal   : {row['BreakoutDay']}")
-        print(f"  Momentum           : ADX = {row['ADX']} | ROC(10) = {row['ROC(10)']}%")
-        print(f"  Zona Fibo Ideal    : {row['Fibo618']} (61.8%) s/d {row['Fibo382']} (38.2%)")
-        print(f"  Entry (Buy)        : {row['Entry']}")
-        print(f"  Stop Loss          : {row['StopLoss']}")
-        print(f"  Target 1 (Puncak)  : {row['Target1(Peak)']}")
-        print(f"  Target 2 (Ext 127%): {row['Target2(Ext)']}")
-        print(f"  Risk:Reward        : 1:{row['RR_Ratio']}")
-        print(f"  Saran Posisi       : {row['Lots']} lot\n")
+    # Simpan CSV (format klasik)
+    try:
+        from idx_report_schema import save_report
+        out_file = save_report(df_result, strategy_name="V3 (Retest Fibo)", group="klasik")
+        print(f"\nHasil disimpan ke: {out_file}")
+    except ImportError:
+        out_file = f"idx_master_report_klasik_{datetime.now().strftime('%Y-%m-%d')}.csv"
+        import os
+        write_header = not os.path.exists(out_file)
+        df_result.to_csv(out_file, mode="a" if not write_header else "w", header=write_header, index=False)
+        print(f"\nHasil disimpan ke: {out_file}")
 
-    # [FIX] Nama file konsisten
-    from idx_report_schema import save_report
-
-    out_file = save_report(df_result, strategy_name="V3 (Retest Fibo)", group="klasik")
-    print(f"Hasil ditambahkan ke: {out_file}")
     return df_result
+
 
 if __name__ == "__main__":
     run_screener()
