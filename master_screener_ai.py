@@ -220,51 +220,26 @@ def analyze_ihsg_regime(lookback_days: int = 180) -> dict:
 
 
 def apply_enrichment_to_latest_reports():
-    """
-    Setelah semua strategi selesai:
-    1. Tambahkan Trailing Stop
-    2. Tambahkan Fundamental + Valuasi (Undervalued / Fair / Overvalued)
-    """
-    print("\n" + "=" * 80)
-    print("MENAMBAHKAN TRAILING STOP + FUNDAMENTAL / VALUASI")
-    print("=" * 80)
-
-    for group in ["klasik", "smc"]:
-        fpath = get_report_filename(group)
-
+    today = datetime.now().strftime("%Y-%m-%d")
+    for ver in ["v2", "v3", "v4", "v5"]:
+        fpath = f"idx_report_{ver}_{today}.csv"
         if not os.path.exists(fpath):
-            print(f"  • {group.upper()}: file tidak ditemukan, dilewati.")
             continue
-
         try:
             df = pd.read_csv(fpath)
             if df.empty:
-                print(f"  • {group.upper()}: kosong, dilewati.")
                 continue
-
-            n_before = len(df.columns)
-
-            # 1. Trailing Stop
             if TRAILING_AVAILABLE:
                 df = enrich_with_trailing_stop(df)
-                print(f"  • {group.upper()}: trailing stop ditambahkan.")
-            else:
-                print(f"  • {group.upper()}: trailing stop dilewati (modul tidak ada).")
-
-            # 2. Fundamental + Valuasi
-            if FUNDAMENTAL_AVAILABLE:
+            try:
+                from idx_fundamental import enrich_with_fundamental
                 df = enrich_with_fundamental(df)
-                print(f"  • {group.upper()}: fundamental + valuasi ditambahkan.")
-            else:
-                print(f"  • {group.upper()}: fundamental dilewati (modul tidak ada).")
-
+            except ImportError:
+                pass
             df.to_csv(fpath, index=False)
-            print(f"  • {os.path.basename(fpath)} → selesai ({len(df)} baris, {len(df.columns)} kolom).")
-
+            print(f"  • {fpath} enrich OK ({len(df)} baris)")
         except Exception as e:
-            print(f"  • Gagal memproses {group}: {e}")
-
-    print("Selesai enrichment.")
+            print(f"  • Gagal {ver}: {e}")
 
 
 def run_orchestrator(account_size: float = None, risk_pct: float = None):

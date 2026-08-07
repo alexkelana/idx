@@ -434,12 +434,10 @@ def run_screener(universe=None, params=None):
             print(f"  Saran ukuran posisi: {row['SuggestedLots']} lot ({row['SuggestedShares']} lembar, ~Rp {row['EstCapitalUsed(Rp)']:,.0f})")
         print()
 
-    # [FIX] Nama file konsisten + Strategy column
-    from idx_report_schema import save_report
-
-    out_file = save_report(df_result, strategy_name="V2 (Breakout)", group="klasik")
+    df_result["Strategy"] = "V2 (Breakout)"
+    from idx_report_schema import save_version_report
+    out_file = save_version_report(df_result, "v2")
     print(f"Hasil disimpan ke: {out_file}")
-
     return df_result
 
 if __name__ == "__main__":

@@ -396,18 +396,14 @@ def run_screener(universe=None, params=None):
     print(df_result[show_cols].to_string(index=False))
     print("=" * 120)
 
-    # Simpan CSV (format klasik)
+    df_result["Strategy"] = "V3 (Retest Fibo)"
     try:
-        from idx_report_schema import save_report
-        out_file = save_report(df_result, strategy_name="V3 (Retest Fibo)", group="klasik")
-        print(f"\nHasil disimpan ke: {out_file}")
+        from idx_report_schema import save_version_report
+        out_file = save_version_report(df_result, "v3")
     except ImportError:
-        out_file = f"idx_master_report_klasik_{datetime.now().strftime('%Y-%m-%d')}.csv"
-        import os
-        write_header = not os.path.exists(out_file)
-        df_result.to_csv(out_file, mode="a" if not write_header else "w", header=write_header, index=False)
-        print(f"\nHasil disimpan ke: {out_file}")
-
+        out_file = f"idx_report_v3_{datetime.now().strftime('%Y-%m-%d')}.csv"
+        df_result.to_csv(out_file, index=False)
+    print(f"\nHasil disimpan ke: {out_file}")
     return df_result
 
 

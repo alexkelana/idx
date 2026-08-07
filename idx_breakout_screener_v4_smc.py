@@ -248,10 +248,9 @@ def run_screener_v4(user_params: dict = None):
     print(df_res.to_string(index=False))
     print("=" * 90)
 
-    # CSV konsisten
-    from idx_report_schema import save_report
-
-    out_file = save_report(df_res, strategy_name="V4 (SMC Order Block)", group="smc")
+    df_res["Strategy"] = "V4 (SMC Order Block)"
+    from idx_report_schema import save_version_report
+    out_file = save_version_report(df_res, "v4")
     print(f"Hasil disimpan ke: {out_file}")
     return df_res
 
