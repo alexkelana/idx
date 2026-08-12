@@ -1,11 +1,11 @@
 """
 IDX Master Screener AI — Streamlit Dashboard
-- Panel rezim IHSG (on-demand, tidak auto-hit setiap refresh)
+- Panel rezim IHSG (on-demand)
 - Jalankan AI adaptive / V2 / V3 / V4 / V5
-- Tab hasil per strategi (CSV terpisah idx_report_v2..v5)
-- Cari file di beberapa path
-- Download CSV
-- Freeze kolom Ticker
+- Tab hasil per strategi (idx_report_v2..v5)
+- Komisi + pajak (enrich lewat master / fallback)
+- Status run terakhir
+- Download CSV + freeze Ticker
 """
 
 import streamlit as st
@@ -43,6 +43,29 @@ risk_pct = st.sidebar.number_input(
     max_value=10.0,
     value=1.0,
     step=0.1,
+)
+
+st.sidebar.markdown("---")
+st.sidebar.header("💸 Komisi & Pajak")
+broker_buy = st.sidebar.number_input(
+    "Fee Beli broker (%)",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.15,
+    step=0.01,
+    help="Komisi beli murni (belum termasuk PPN & levy)",
+)
+broker_sell = st.sidebar.number_input(
+    "Fee Jual broker (%)",
+    min_value=0.0,
+    max_value=1.0,
+    value=0.25,
+    step=0.01,
+    help="Komisi jual murni (PPh Final 0,1% dihitung terpisah)",
+)
+st.sidebar.caption(
+    "Otomatis ditambah: PPN 12% atas fee · Levy ~0,043% · "
+    "PPh Final 0,1% (hanya jual)"
 )
 
 st.sidebar.markdown("---")
@@ -102,12 +125,64 @@ def run_v5(p):
     m.run_screener_v5(user_params=p)
 
 
-def run_ai(account_size, risk_pct):
+def run_ai(account_size, risk_pct, broker_buy_pct, broker_sell_pct):
     import master_screener_ai
     master_screener_ai.run_orchestrator(
         account_size=float(account_size),
         risk_pct=float(risk_pct),
+        broker_buy_pct=float(broker_buy_pct),
+        broker_sell_pct=float(broker_sell_pct),
     )
+
+
+def enrich_all_version_csvs(broker_buy_pct, broker_sell_pct):
+    """Enrich idx_report_v*_hari_ini: trailing + fundamental + biaya/pajak."""
+    try:
+        import master_screener_ai
+        if hasattr(master_screener_ai, "apply_enrichment_to_latest_reports"):
+            master_screener_ai.apply_enrichment_to_latest_reports(
+                broker_buy_pct=float(broker_buy_pct),
+                broker_sell_pct=float(broker_sell_pct),
+            )
+            return
+    except Exception:
+        pass
+
+    # Fallback lokal
+    try:
+        from idx_cost_tax import enrich_dataframe_with_costs
+    except ImportError:
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    for ver in ["v2", "v3", "v4", "v5"]:
+        # cari di beberapa path
+        path = None
+        for d in _search_dirs():
+            cand = os.path.join(d, f"idx_report_{ver}_{today}.csv")
+            if os.path.exists(cand):
+                path = cand
+                break
+        if not path:
+            continue
+        try:
+            df = pd.read_csv(path)
+            if df.empty:
+                continue
+            try:
+                from idx_trailing_stop import enrich_with_trailing_stop
+                df = enrich_with_trailing_stop(df)
+            except Exception:
+                pass
+            try:
+                from idx_fundamental import enrich_with_fundamental
+                df = enrich_with_fundamental(df)
+            except Exception:
+                pass
+            df = enrich_dataframe_with_costs(df, broker_buy_pct, broker_sell_pct)
+            df.to_csv(path, index=False)
+        except Exception:
+            continue
 
 
 # =====================================================================
@@ -128,7 +203,6 @@ def _search_dirs():
 
 
 def find_report(version: str):
-    """Cari idx_report_v{N}_*.csv di beberapa folder; ambil yang terbaru."""
     files = []
     for d in _search_dirs():
         files.extend(glob.glob(os.path.join(d, f"idx_report_{version}_*.csv")))
@@ -155,7 +229,6 @@ def show_report(version: str, title: str):
             st.warning("File kosong.")
             return
 
-        # Download
         with open(path, "rb") as f:
             st.download_button(
                 label=f"⬇️ Download {os.path.basename(path)}",
@@ -165,7 +238,6 @@ def show_report(version: str, title: str):
                 key=f"dl_{version}",
             )
 
-        # Freeze Ticker
         view = df.copy()
         if "Ticker" in view.columns:
             view = view.drop_duplicates(subset=["Ticker"], keep="first")
@@ -178,7 +250,7 @@ def show_report(version: str, title: str):
 
 
 # =====================================================================
-# PANEL REZIM IHSG (on-demand saja)
+# PANEL REZIM IHSG (on-demand)
 # =====================================================================
 st.subheader("📡 Kondisi Pasar IHSG")
 
@@ -197,7 +269,6 @@ if cek_rezim:
                 "last_close": None,
             }
 
-# Placeholder jika belum pernah dicek
 if "ihsg_regime" not in st.session_state:
     st.session_state["ihsg_regime"] = {
         "regime": "Belum dicek",
@@ -215,10 +286,26 @@ elif "BEARISH" in str(regime):
     st.error(f"**Rezim: {regime}**")
 elif "SIDEWAYS" in str(regime):
     st.warning(f"**Rezim: {regime}**")
-elif regime == "Belum dicek":
-    st.info(f"**Rezim: {regime}**")
 else:
     st.info(f"**Rezim: {regime}**")
+
+activity = reg.get("activity", "Belum dicek")
+if activity == "RAMAI":
+    st.success(f"**Aktivitas pasar: {activity} (bergairah)**")
+elif activity == "SEPI":
+    st.warning(f"**Aktivitas pasar: {activity} (lesu)**")
+elif activity == "NORMAL":
+    st.info(f"**Aktivitas pasar: {activity}**")
+
+for r in reg.get("activity_reason") or []:
+    st.caption(r)
+
+if reg.get("vol_ratio_20") is not None:
+    st.caption(
+        f"Vol IHSG: {reg['vol_ratio_20']}x avg20 · "
+        f"Range5: {reg.get('range_5_pct', '-')}% · "
+        f"Range20: {reg.get('range_20_pct', '-')}%"
+    )
 
 mc = st.columns(4)
 if reg.get("last_close"):
@@ -244,13 +331,18 @@ if run_button:
     params = {
         "account_size": float(account_size),
         "risk_per_trade_pct": float(risk_pct),
+        "broker_buy_pct": float(broker_buy),
+        "broker_sell_pct": float(broker_sell),
     }
     label = mode
     started_at = datetime.now()
 
     with st.spinner(f"Menjalankan {label}... (1–3 menit)"):
         if mode.startswith("🤖"):
-            ok, err, log = capture_run(run_ai, account_size, risk_pct)
+            # [FIX] teruskan fee ke master
+            ok, err, log = capture_run(
+                run_ai, account_size, risk_pct, broker_buy, broker_sell
+            )
             try:
                 import master_screener_ai
                 st.session_state["ihsg_regime"] = master_screener_ai.analyze_ihsg_regime()
@@ -267,10 +359,14 @@ if run_button:
         else:
             ok, err, log = False, "Mode tidak dikenal", ""
 
+        # [FIX] Setelah run versi tunggal → enrich di satu tempat
+        # (AI Adaptive sudah enrich di dalam master)
+        if ok and not mode.startswith("🤖"):
+            enrich_all_version_csvs(broker_buy, broker_sell)
+
     finished_at = datetime.now()
     duration_sec = (finished_at - started_at).total_seconds()
 
-    # Hitung jumlah baris hasil per versi (file terbaru)
     counts = {}
     for ver in ["v2", "v3", "v4", "v5"]:
         path = find_report(ver)
@@ -293,6 +389,8 @@ if run_button:
         "counts": counts,
         "account_size": float(account_size),
         "risk_pct": float(risk_pct),
+        "broker_buy": float(broker_buy),
+        "broker_sell": float(broker_sell),
     }
 
     if ok:
@@ -303,10 +401,46 @@ if run_button:
     with st.expander("📋 Log", expanded=not ok):
         st.text(log if log and log.strip() else "(kosong)")
 
-    # Jangan st.rerun() langsung agar status & log sempat terbaca;
-    # user bisa refresh manual atau klik tab hasil.
-    # Jika ingin auto-refresh tabel saja, uncomment:
-    # st.rerun()
+# =====================================================================
+# STATUS RUN TERAKHIR
+# =====================================================================
+st.subheader("📌 Status Run Terakhir")
+status = st.session_state.get("last_run_status")
+
+if not status:
+    st.info("Belum ada screener yang dijalankan di sesi ini.")
+else:
+    if status.get("ok"):
+        st.success("Status: **Berhasil**")
+    else:
+        st.error(f"Status: **Gagal** — {status.get('error') or '-'}")
+
+    # Baris ringkas — font kecil via caption / markdown
+    st.caption(
+        f"**Mode:** {status.get('mode', '-')} · "
+        f"**Durasi:** {status.get('duration_sec', 0)} dtk · "
+        f"**Mulai:** {status.get('started_at', '-')} · "
+        f"**Selesai:** {status.get('finished_at', '-')}"
+    )
+    st.caption(
+        f"Modal: Rp {status.get('account_size', 0):,.0f} · "
+        f"Risiko: {status.get('risk_pct', 0)}% · "
+        f"Fee beli/jual: {status.get('broker_buy', 0)}% / {status.get('broker_sell', 0)}%"
+    )
+
+    counts = status.get("counts") or {}
+    if counts:
+        st.caption(
+            f"Setup — V2: **{counts.get('v2', 0)}** · "
+            f"V3: **{counts.get('v3', 0)}** · "
+            f"V4: **{counts.get('v4', 0)}** · "
+            f"V5: **{counts.get('v5', 0)}**"
+        )
+
+    with st.expander("📋 Log run terakhir", expanded=False):
+        st.text(status.get("log") or "(kosong)")
+
+st.markdown("---")
 
 # =====================================================================
 # HASIL PER STRATEGI
