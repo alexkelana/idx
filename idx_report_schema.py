@@ -12,20 +12,18 @@ import pandas as pd
 
 
 def save_version_report(df: pd.DataFrame, version: str) -> str:
-    """
-    Simpan hasil screener ke file terpisah per versi.
-    version: 'v2' | 'v3' | 'v4' | 'v5'
-    → idx_report_v2_YYYY-MM-DD.csv (overwrite hari yang sama)
-    """
     if df is None or (isinstance(df, pd.DataFrame) and df.empty):
         return ""
 
     ver = str(version).lower().strip().replace(" ", "")
-    if not ver.startswith("v"):
+    # Hanya tambah "v" untuk nomor strategi (2, 3, 4, 5)
+    if ver.isdigit():
         ver = f"v{ver}"
+    elif ver.startswith("v") and len(ver) > 1 and ver[1:].isdigit():
+        pass  # sudah v2, v3, ...
+    # else: intraday, klasik, smc, dll. → biarkan apa adanya
 
     fname = f"idx_report_{ver}_{datetime.now().strftime('%Y-%m-%d')}.csv"
-    df = df.copy()
     df.to_csv(fname, index=False)
     print(f"Hasil disimpan ke: {fname}")
     return fname
