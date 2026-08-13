@@ -78,6 +78,7 @@ mode = st.sidebar.radio(
         "V3 — Retest Fibo",
         "V4 — Order Block",
         "V5 — CHOCH",
+        "⚡ Intraday — Confluence",
     ],
 )
 run_button = st.sidebar.button("▶️ JALANKAN", width="stretch", type="primary")
@@ -134,6 +135,9 @@ def run_ai(account_size, risk_pct, broker_buy_pct, broker_sell_pct):
         broker_sell_pct=float(broker_sell_pct),
     )
 
+def run_intraday(p):
+    m = importlib.import_module("idx_intraday_screener")
+    m.run_intraday_screener(user_params=p)
 
 def enrich_all_version_csvs(broker_buy_pct, broker_sell_pct):
     """Enrich idx_report_v*_hari_ini: trailing + fundamental + biaya/pajak."""
@@ -155,7 +159,7 @@ def enrich_all_version_csvs(broker_buy_pct, broker_sell_pct):
         return
 
     today = datetime.now().strftime("%Y-%m-%d")
-    for ver in ["v2", "v3", "v4", "v5"]:
+    for ver in ["v2", "v3", "v4", "v5", "intraday"]:
         # cari di beberapa path
         path = None
         for d in _search_dirs():
@@ -356,6 +360,9 @@ if run_button:
             ok, err, log = capture_run(run_v4, params)
         elif mode.startswith("V5"):
             ok, err, log = capture_run(run_v5, params)
+        elif mode.startswith("⚡"):
+            ok, err, log = capture_run(run_intraday, params)
+        
         else:
             ok, err, log = False, "Mode tidak dikenal", ""
 
@@ -368,7 +375,7 @@ if run_button:
     duration_sec = (finished_at - started_at).total_seconds()
 
     counts = {}
-    for ver in ["v2", "v3", "v4", "v5"]:
+    for ver in ["v2", "v3", "v4", "v5", "intraday"]:
         path = find_report(ver)
         n = 0
         if path and os.path.exists(path):
@@ -447,11 +454,12 @@ st.markdown("---")
 # =====================================================================
 st.subheader("📊 Hasil Screener per Strategi")
 
-t2, t3, t4, t5 = st.tabs([
+t2, t3, t4, t5, t_intra = st.tabs([
     "V2 Breakout",
     "V3 Retest Fibo",
     "V4 Order Block",
     "V5 CHOCH",
+    "⚡ Intraday",
 ])
 
 with t2:
@@ -462,6 +470,8 @@ with t4:
     show_report("v4", "V4 Order Block")
 with t5:
     show_report("v5", "V5 CHOCH")
+with t_intra:
+    show_report("intraday", "Intraday Confluence")
 
 st.markdown("---")
 st.caption("IDX Master Screener AI • Bukan rekomendasi investasi")
