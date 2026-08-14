@@ -11,6 +11,10 @@ Karakter pasar Indonesia yang dipertahankan:
 - RR minimum realistis (1.5), bukan 2.0 kaku
 - Tick size + ARA/ARB BEI
 - SL di bawah invalidation (swing low)
+
++ SL hybrid kondisional (sama seperti V4):
+  - Invalidasi (lowest_low) ≤ max_sl_pct → ATR boleh memperketat
+  - Di luar range → SL struktur murni
 """
 
 from __future__ import annotations
@@ -21,9 +25,14 @@ import yfinance as yf
 from datetime import datetime
 from idx_liquidity_scanner import IdxLiquidityScanner
 
-# =========================================================================
-# UTILITAS BEI
-# =========================================================================
+SL_PARAMS = {
+    "atr_period": 14,
+    "sl_struct_buf": 0.015,
+    "sl_atr_mult": 1.2,
+    "max_sl_pct": 3.5,
+}
+
+
 def round_to_idx_tick(price: float) -> int:
     if pd.isna(price) or price <= 0:
         return 0
@@ -50,14 +59,52 @@ def apply_ara_arb_limits(price: float, prev_close: float, is_target: bool) -> fl
     return min(price, ara) if is_target else max(price, arb)
 
 
-# =========================================================================
-# DETEKSI CHOCH + DISCOUNT
-# =========================================================================
+def compute_atr(df: pd.DataFrame, period: int = 14) -> float:
+    h, l, c = df["High"], df["Low"], df["Close"]
+    prev = c.shift(1)
+    tr = pd.concat([h - l, (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
+    val = float(tr.rolling(period).mean().iloc[-1])
+    return val if val == val and val > 0 else 0.0
+
+
+def stop_loss_struct_with_optional_atr(
+    entry: float,
+    struct_level: float,
+    atr: float,
+    prev_close: float,
+    params: dict,
+) -> tuple[int, str]:
+    buf = params.get("sl_struct_buf", 0.015)
+    k = params.get("sl_atr_mult", 1.2)
+    max_sl_pct = params.get("max_sl_pct", 3.5)
+
+    sl_struct = float(struct_level) * (1.0 - buf)
+    if sl_struct >= entry:
+        sl_struct = entry * 0.99
+
+    dist_pct = (entry - sl_struct) / entry * 100.0
+
+    if dist_pct <= max_sl_pct and atr and atr > 0:
+        sl_atr = entry - k * atr
+        stop_raw = max(sl_struct, sl_atr)
+        source = "struct+atr"
+    else:
+        stop_raw = sl_struct
+        source = "struct"
+
+    if stop_raw >= entry:
+        stop_raw = entry * 0.99
+
+    stop = round_to_idx_tick(stop_raw)
+    stop = apply_ara_arb_limits(stop, prev_close, is_target=False)
+    if stop >= entry:
+        stop = apply_ara_arb_limits(
+            round_to_idx_tick(entry * 0.99), prev_close, is_target=False
+        )
+    return int(stop), source
+
+
 def detect_choch_and_discount(df: pd.DataFrame, lookback: int = 60) -> dict | None:
-    """
-    Deteksi CHOCH bullish setelah struktur turun sederhana.
-    Index disimpan absolut agar aman dipakai di full df.
-    """
     if len(df) < 20:
         return None
 
@@ -70,87 +117,83 @@ def detect_choch_and_discount(df: pd.DataFrame, lookback: int = 60) -> dict | No
     low = df_sub["Low"].values
     close = df_sub["Close"].values
 
-    # 1. Swing points (fractal 5 bar)
-    swing_highs = []
-    swing_lows = []
+    swing_highs, swing_lows = [], []
     for i in range(2, len(df_sub) - 2):
-        if high[i] > high[i - 1] and high[i] > high[i - 2] and high[i] > high[i + 1] and high[i] > high[i + 2]:
+        if (
+            high[i] > high[i - 1]
+            and high[i] > high[i - 2]
+            and high[i] > high[i + 1]
+            and high[i] > high[i + 2]
+        ):
             swing_highs.append((i, float(high[i])))
-        if low[i] < low[i - 1] and low[i] < low[i - 2] and low[i] < low[i + 1] and low[i] < low[i + 2]:
+        if (
+            low[i] < low[i - 1]
+            and low[i] < low[i - 2]
+            and low[i] < low[i + 1]
+            and low[i] < low[i + 2]
+        ):
             swing_lows.append((i, float(low[i])))
 
     if len(swing_highs) < 2 or len(swing_lows) < 2:
         return None
 
-    # 2. Struktur turun sederhana (karakter bearish sebelum CHOCH)
-    #    Minimal: swing high terakhir < swing high sebelumnya
-    #    ATAU swing low terakhir <= swing low sebelumnya (LL / non-HH)
     sh1, sh2 = swing_highs[-2], swing_highs[-1]
     sl1, sl2 = swing_lows[-2], swing_lows[-1]
     has_lower_high = sh2[1] < sh1[1]
     has_lower_low = sl2[1] <= sl1[1]
     if not (has_lower_high or has_lower_low):
-        return None  # bukan tekanan jual yang jelas
+        return None
 
-    # 3. CHOCH: close menembus swing high terakhir (setelah struktur turun)
     last_sh_idx, last_sh_val = sh2
     choch_rel = -1
     for i in range(last_sh_idx + 1, len(df_sub)):
         if close[i] > last_sh_val:
             choch_rel = i
             break
-
     if choch_rel == -1:
         return None
 
-    # Freshness: CHOCH tidak lebih tua dari 20 bar (karakter IDX — setup cepat basi)
     age_bars = len(df_sub) - 1 - choch_rel
     if age_bars > 20:
         return None
 
-    # 4. Range & Fibo
     lowest_low = float(df_sub["Low"].iloc[:choch_rel].min())
     peak_after = float(df_sub["High"].iloc[choch_rel:].max())
     range_up = peak_after - lowest_low
     if range_up <= 0:
         return None
 
-    # Hindari range terlalu kecil (noise)
     last_close_sub = float(close[-1])
-    if range_up / last_close_sub < 0.04:  # range < 4%
+    if range_up / last_close_sub < 0.04:
         return None
 
-    fibo_382 = peak_after - range_up * 0.382
-    fibo_50 = peak_after - range_up * 0.50
-    fibo_618 = peak_after - range_up * 0.618
-    fibo_786 = peak_after - range_up * 0.786
-
     return {
-        "choch_idx": start_pos + choch_rel,  # absolut
+        "choch_idx": start_pos + choch_rel,
         "choch_val": last_sh_val,
         "choch_age": age_bars,
         "lowest_low": lowest_low,
         "peak": peak_after,
-        "fibo_382": fibo_382,
-        "fibo_50": fibo_50,
-        "fibo_618": fibo_618,
-        "fibo_786": fibo_786,
+        "fibo_382": peak_after - range_up * 0.382,
+        "fibo_50": peak_after - range_up * 0.50,
+        "fibo_618": peak_after - range_up * 0.618,
+        "fibo_786": peak_after - range_up * 0.786,
         "has_lower_high": has_lower_high,
         "has_lower_low": has_lower_low,
     }
 
 
-# =========================================================================
-# ANALISA TICKER
-# =========================================================================
 def analyze_smc_v5_ticker(symbol: str, user_params: dict = None) -> dict | None:
     ticker = symbol + ".JK"
 
     account_size = 50_000_000
     risk_pct = 1.0
+    sl_cfg = SL_PARAMS.copy()
     if user_params:
-        account_size = user_params.get("account_size", 50_000_000)
-        risk_pct = user_params.get("risk_per_trade_pct", 1.0)
+        account_size = user_params.get("account_size", account_size)
+        risk_pct = user_params.get("risk_per_trade_pct", risk_pct)
+        for k in SL_PARAMS:
+            if k in user_params:
+                sl_cfg[k] = user_params[k]
 
     try:
         df = yf.download(
@@ -184,17 +227,10 @@ def analyze_smc_v5_ticker(symbol: str, user_params: dict = None) -> dict | None:
         return None
 
     last_close = float(df["Close"].iloc[-1])
-    last_low = float(df["Low"].iloc[-1])
-
     choch = detect_choch_and_discount(df, lookback=60)
     if not choch:
         return None
 
-    # ------------------------------------------------------------------
-    # ZONA ENTRY — karakter IDX
-    # Discount praktis: antara Fibo 38.2% dan 78.6%, di atas lowest low
-    # Prioritas lebih tinggi jika di bawah Fibo 50% (discount lebih dalam)
-    # ------------------------------------------------------------------
     in_discount_zone = (
         choch["fibo_786"] <= last_close <= choch["fibo_382"]
         and last_close >= choch["lowest_low"] * 0.995
@@ -203,33 +239,28 @@ def analyze_smc_v5_ticker(symbol: str, user_params: dict = None) -> dict | None:
         return None
 
     deep_discount = last_close <= choch["fibo_50"]
-
-    # Optional: harga sudah menyentuh zona (mitigation-ish)
-    # tidak wajib hard reject jika close di zona
-
     entry = round_to_idx_tick(last_close)
+    atr = compute_atr(df, sl_cfg["atr_period"])
 
-    # SL di bawah swing low (invalidation) + buffer tipis
-    stop_loss_raw = choch["lowest_low"] * 0.985
-    stop_loss = apply_ara_arb_limits(
-        round_to_idx_tick(stop_loss_raw), last_close, is_target=False
+    stop_loss, sl_src = stop_loss_struct_with_optional_atr(
+        entry=entry,
+        struct_level=float(choch["lowest_low"]),
+        atr=atr,
+        prev_close=last_close,
+        params=sl_cfg,
     )
 
     risk_per_share = entry - stop_loss
     if risk_per_share <= 0:
         return None
 
-    # Target: peak pasca CHOCH (liquidity / premium)
     target_1 = apply_ara_arb_limits(
         round_to_idx_tick(choch["peak"]), last_close, is_target=True
     )
-
     rr_ratio = (target_1 - entry) / risk_per_share if risk_per_share > 0 else 0
-    # [FIX] RR min 1.5 — realistis untuk IDX (bukan 2.0 kaku)
     if rr_ratio < 1.5:
         return None
 
-    # Score sederhana (fresh + deep discount + struktur)
     score = 40
     reasons = ["CHOCH Bullish"]
     if choch["choch_age"] <= 8:
@@ -250,14 +281,12 @@ def analyze_smc_v5_ticker(symbol: str, user_params: dict = None) -> dict | None:
     elif choch["has_lower_high"] or choch["has_lower_low"]:
         score += 8
         reasons.append("Struktur turun")
+    reasons.append(f"SL:{sl_src}")
 
-    # Position sizing
     risk_rp = account_size * (risk_pct / 100.0)
     shares = int(risk_rp / risk_per_share) if risk_per_share > 0 else 0
     lots = shares // 100
     actual_shares = lots * 100
-    est_loss = actual_shares * risk_per_share
-    est_profit = actual_shares * (target_1 - entry)
 
     return {
         "Ticker": symbol,
@@ -269,20 +298,19 @@ def analyze_smc_v5_ticker(symbol: str, user_params: dict = None) -> dict | None:
         "Fibo_786": round_to_idx_tick(choch["fibo_786"]),
         "Entry": entry,
         "StopLoss": stop_loss,
+        "SL_Source": sl_src,
+        "ATR": round(atr, 0),
         "Target(Peak)": target_1,
         "RR_Ratio": round(rr_ratio, 2),
         "Score": score,
         "Alasan": "; ".join(reasons),
         "Lots": lots,
-        "EstLoss(Rp)": round(est_loss, 0),
-        "EstProfit(Rp)": round(est_profit, 0),
+        "EstLoss(Rp)": round(actual_shares * risk_per_share, 0),
+        "EstProfit(Rp)": round(actual_shares * (target_1 - entry), 0),
         "Strategy": "V5 (SMC CHOCH)",
     }
 
 
-# =========================================================================
-# RUNNER
-# =========================================================================
 def run_screener_v5(user_params: dict = None):
     print("Mempersiapkan Universe Likuiditas (SMC V5)...")
     scanner = IdxLiquidityScanner(
@@ -303,7 +331,6 @@ def run_screener_v5(user_params: dict = None):
             continue
 
     print(" " * 60, end="\r")
-
     if not results:
         print("Tidak ada saham di zona Discount pasca CHOCH yang valid hari ini.")
         return None
@@ -317,15 +344,20 @@ def run_screener_v5(user_params: dict = None):
     print("=" * 100)
     cols = [
         "Ticker", "Close", "CHOCH_Level", "CHOCH_Age", "Entry", "StopLoss",
-        "Target(Peak)", "RR_Ratio", "Score", "Lots", "Alasan",
+        "SL_Source", "Target(Peak)", "RR_Ratio", "Score", "Lots", "Alasan",
     ]
     cols = [c for c in cols if c in df_res.columns]
     print(df_res[cols].to_string(index=False))
     print("=" * 100)
 
-    df_res["Strategy"] = "V4 (SMC Order Block)"
-    from idx_report_schema import save_version_report
-    out_file = save_version_report(df_res, "v4")
+    # [FIX] sebelumnya salah tulis V4 / save v4
+    df_res["Strategy"] = "V5 (SMC CHOCH)"
+    try:
+        from idx_report_schema import save_version_report
+        out_file = save_version_report(df_res, "v5")
+    except ImportError:
+        out_file = f"idx_report_v5_{datetime.now().strftime('%Y-%m-%d')}.csv"
+        df_res.to_csv(out_file, index=False)
     print(f"Hasil disimpan ke: {out_file}")
     return df_res
 

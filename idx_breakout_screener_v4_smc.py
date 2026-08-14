@@ -13,13 +13,29 @@ Bug yang diperbaiki:
 - bos_idx sekarang absolut (Target Liquidity tidak loncat jauh)
 - MultiIndex & data guard
 - Download lebih stabil
+
+Aturan original + bug index fixed + SL hybrid kondisional:
+- Jika jarak invalidasi (OB bottom) ≤ max_sl_pct → ATR boleh memperketat
+- Jika di luar range → SL = struktur murni (OB_bottom × buffer)
 """
+
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from datetime import datetime
 from idx_liquidity_scanner import IdxLiquidityScanner
+
+# =========================================================================
+# PARAMETER SL
+# =========================================================================
+SL_PARAMS = {
+    "atr_period": 14,
+    "sl_struct_buf": 0.015,   # 1.5% di bawah OB bottom
+    "sl_atr_mult": 1.2,
+    "max_sl_pct": 3.5,        # ambang "masuk range"
+}
 
 # =========================================================================
 # UTILITAS BEI
@@ -42,24 +58,73 @@ def round_to_idx_tick(price: float) -> int:
     else:
         return int(round(price / 25.0) * 25)
 
+
 def apply_ara_arb_limits(price: float, prev_close: float, is_target: bool) -> float:
     limit = 0.35 if prev_close < 200 else (0.25 if prev_close <= 5000 else 0.20)
     ara = round_to_idx_tick(prev_close * (1 + limit))
     arb = round_to_idx_tick(prev_close * (1 - limit))
     return min(price, ara) if is_target else max(price, arb)
 
+
+def compute_atr(df: pd.DataFrame, period: int = 14) -> float:
+    h, l, c = df["High"], df["Low"], df["Close"]
+    prev = c.shift(1)
+    tr = pd.concat([h - l, (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
+    val = float(tr.rolling(period).mean().iloc[-1])
+    return val if val == val and val > 0 else 0.0
+
+
+def stop_loss_struct_with_optional_atr(
+    entry: float,
+    struct_level: float,
+    atr: float,
+    prev_close: float,
+    params: dict,
+) -> tuple[int, str]:
+    """
+    Masuk range (jarak struct ≤ max_sl_pct) → ATR boleh memperketat.
+    Luar range → prinsip awal (struktur × buffer).
+    ATR tidak pernah menaruh SL di bawah struktur.
+    """
+    buf = params.get("sl_struct_buf", 0.015)
+    k = params.get("sl_atr_mult", 1.2)
+    max_sl_pct = params.get("max_sl_pct", 3.5)
+
+    sl_struct = float(struct_level) * (1.0 - buf)
+    if sl_struct >= entry:
+        sl_struct = entry * 0.99
+
+    dist_pct = (entry - sl_struct) / entry * 100.0
+
+    if dist_pct <= max_sl_pct and atr and atr > 0:
+        sl_atr = entry - k * atr
+        stop_raw = max(sl_struct, sl_atr)  # tidak di bawah struktur
+        source = "struct+atr"
+    else:
+        stop_raw = sl_struct
+        source = "struct"
+
+    if stop_raw >= entry:
+        stop_raw = entry * 0.99
+
+    stop = round_to_idx_tick(stop_raw)
+    stop = apply_ara_arb_limits(stop, prev_close, is_target=False)
+    if stop >= entry:
+        stop = apply_ara_arb_limits(
+            round_to_idx_tick(entry * 0.99), prev_close, is_target=False
+        )
+    return int(stop), source
+
+
 # =========================================================================
-# SMC ALGORITHMS (bug indexing diperbaiki)
+# SMC — OB / FVG
 # =========================================================================
 def detect_smc_zones(df: pd.DataFrame, lookback: int = 60):
-    """Mendeteksi Order Block dan FVG. Index disimpan secara absolut."""
     if len(df) < 15:
         return []
 
-    # [FIX] Simpan offset agar index absolut
     start_pos = max(0, len(df) - lookback)
     df_sub = df.iloc[start_pos:].copy()
-
     if len(df_sub) < 10:
         return []
 
@@ -68,57 +133,56 @@ def detect_smc_zones(df: pd.DataFrame, lookback: int = 60):
     close = df_sub["Close"].values
     open_p = df_sub["Open"].values
 
-    # 1. Cari Swing High
     swing_highs = []
     for i in range(2, len(df_sub) - 2):
-        if (high[i] > high[i-1] and high[i] > high[i-2] and
-            high[i] > high[i+1] and high[i] > high[i+2]):
+        if (
+            high[i] > high[i - 1]
+            and high[i] > high[i - 2]
+            and high[i] > high[i + 1]
+            and high[i] > high[i + 2]
+        ):
             swing_highs.append((i, high[i]))
 
     ob_zones = []
-
-    # 2. Cari BOS & FVG
     for sh_idx, sh_val in swing_highs:
         for i in range(sh_idx + 1, len(df_sub) - 2):
-            if close[i] > sh_val:  # BOS
+            if close[i] > sh_val:
                 fvg_gap = low[i + 1] - high[i - 1]
-                has_fvg = fvg_gap > 0
-
-                if has_fvg:
-                    # Cari candle bearish terakhir (Order Block)
+                if fvg_gap > 0:
                     ob_candle_idx = -1
                     for j in range(i - 1, sh_idx - 1, -1):
                         if close[j] < open_p[j]:
                             ob_candle_idx = j
                             break
-
                     if ob_candle_idx != -1:
-                        # [FIX] Konversi ke index absolut
-                        absolute_bos_idx = start_pos + i
-                        absolute_ob_idx = start_pos + ob_candle_idx
-
-                        ob_zones.append({
-                            "bos_idx": absolute_bos_idx,
-                            "ob_idx": absolute_ob_idx,
-                            "ob_high": float(high[ob_candle_idx]),
-                            "ob_low": float(low[ob_candle_idx]),
-                            "fvg_gap": float(fvg_gap),
-                        })
+                        ob_zones.append(
+                            {
+                                "bos_idx": start_pos + i,
+                                "ob_idx": start_pos + ob_candle_idx,
+                                "ob_high": float(high[ob_candle_idx]),
+                                "ob_low": float(low[ob_candle_idx]),
+                                "fvg_gap": float(fvg_gap),
+                            }
+                        )
                         break
-
     return ob_zones
 
+
 # =========================================================================
-# ANALISIS (aturan original dipertahankan)
+# ANALISA
 # =========================================================================
 def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
     ticker = symbol + ".JK"
 
     account_size = 5_000_000
     risk_pct = 1.0
+    sl_cfg = SL_PARAMS.copy()
     if user_params:
-        account_size = user_params.get("account_size", 5_000_000)
-        risk_pct = user_params.get("risk_per_trade_pct", 1.0)
+        account_size = user_params.get("account_size", account_size)
+        risk_pct = user_params.get("risk_per_trade_pct", risk_pct)
+        for k in SL_PARAMS:
+            if k in user_params:
+                sl_cfg[k] = user_params[k]
 
     try:
         df = yf.download(
@@ -135,7 +199,6 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
     if df is None or df.empty or len(df) < 40:
         return None
 
-    # MultiIndex fallback
     if isinstance(df.columns, pd.MultiIndex):
         try:
             df.columns = df.columns.get_level_values(0)
@@ -145,7 +208,7 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
             except Exception:
                 return None
 
-    if "Close" not in df.columns or "High" not in df.columns or "Low" not in df.columns:
+    if any(c not in df.columns for c in ["Open", "High", "Low", "Close"]):
         return None
 
     df = df.dropna()
@@ -155,39 +218,35 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
     last_close = float(df["Close"].iloc[-1])
     last_low = float(df["Low"].iloc[-1])
 
-    # Deteksi Zona SMC
     ob_zones = detect_smc_zones(df, lookback=60)
     if not ob_zones:
         return None
 
-    # ===== ATURAN ORIGINAL DIPERTAHANKAN =====
-    # Ambil OB yang paling baru
     latest_ob = ob_zones[-1]
     ob_top = latest_ob["ob_high"]
     ob_bottom = latest_ob["ob_low"]
 
-    # Maksimal jarak 3%
     dist_to_ob_pct = (last_close - ob_top) / ob_top * 100
-
-    # Harus menyentuh OB (mitigation)
     has_mitigated = last_low <= ob_top and last_close >= ob_bottom
-
     if dist_to_ob_pct > 3.0 or not has_mitigated:
         return None
 
-    # Trading Plan
     entry = round_to_idx_tick(last_close)
+    atr = compute_atr(df, sl_cfg["atr_period"])
 
-    stop_loss_raw = ob_bottom * 0.985
-    stop_loss = round_to_idx_tick(stop_loss_raw)
-    stop_loss = apply_ara_arb_limits(stop_loss, last_close, is_target=False)
+    stop_loss, sl_src = stop_loss_struct_with_optional_atr(
+        entry=entry,
+        struct_level=float(ob_bottom),
+        atr=atr,
+        prev_close=last_close,
+        params=sl_cfg,
+    )
 
     risk_per_share = entry - stop_loss
     if risk_per_share <= 0:
         return None
 
-    # [FIX] Target sekarang akurat karena bos_idx absolut
-    peak_after_bos = df["High"].iloc[latest_ob["bos_idx"]:].max()
+    peak_after_bos = float(df["High"].iloc[latest_ob["bos_idx"] :].max())
     target_1 = apply_ara_arb_limits(
         round_to_idx_tick(peak_after_bos), last_close, is_target=True
     )
@@ -196,13 +255,10 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
     if rr_ratio < 1.5:
         return None
 
-    # Position Sizing
     risk_rp = account_size * (risk_pct / 100.0)
     shares = int(risk_rp / risk_per_share) if risk_per_share > 0 else 0
     lots = shares // 100
     actual_shares = lots * 100
-    est_loss = actual_shares * risk_per_share
-    est_profit = actual_shares * (target_1 - entry)
 
     return {
         "Ticker": symbol,
@@ -211,15 +267,19 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
         "OB_Bottom": round_to_idx_tick(ob_bottom),
         "Entry": entry,
         "StopLoss": stop_loss,
+        "SL_Source": sl_src,
+        "ATR": round(atr, 0),
         "Target(Liquidity)": target_1,
         "RR_Ratio": round(rr_ratio, 2),
         "Lots": lots,
-        "EstLoss(Rp)": round(est_loss, 0),
-        "EstProfit(Rp)": round(est_profit, 0),
+        "EstLoss(Rp)": round(actual_shares * risk_per_share, 0),
+        "EstProfit(Rp)": round(actual_shares * (target_1 - entry), 0),
+        "Strategy": "V4 (SMC Order Block)",
     }
 
+
 def run_screener_v4(user_params: dict = None):
-    print("Mempersiapkan Universe Likuiditas (SMC V4 - Original Rules + Bug Fixed)...")
+    print("Mempersiapkan Universe Likuiditas (SMC V4)...")
     scanner = IdxLiquidityScanner(
         min_avg_value_rp=10_000_000_000,
         min_avg_volume=1_000_000,
@@ -230,29 +290,35 @@ def run_screener_v4(user_params: dict = None):
     results = []
     for i, sym in enumerate(universe, 1):
         print(f"  [{i}/{len(universe)}] Cek {sym}...", end="\r")
-        res = analyze_smc_ticker(sym, user_params)
-        if res:
-            results.append(res)
+        try:
+            res = analyze_smc_ticker(sym, user_params)
+            if res:
+                results.append(res)
+        except Exception:
+            continue
 
     print(" " * 60, end="\r")
-
     if not results:
         print("Tidak ada saham yang sedang Mitigasi Order Block hari ini.")
-        return
+        return None
 
     df_res = pd.DataFrame(results).sort_values("RR_Ratio", ascending=False)
-
     print("\n" + "=" * 90)
-    print("SMC ORDER BLOCK SCREENER V4 - HASIL (Original Rules + Bug Fixed)")
+    print("SMC ORDER BLOCK SCREENER V4")
     print("=" * 90)
     print(df_res.to_string(index=False))
     print("=" * 90)
 
     df_res["Strategy"] = "V4 (SMC Order Block)"
-    from idx_report_schema import save_version_report
-    out_file = save_version_report(df_res, "v4")
+    try:
+        from idx_report_schema import save_version_report
+        out_file = save_version_report(df_res, "v4")
+    except ImportError:
+        out_file = f"idx_report_v4_{datetime.now().strftime('%Y-%m-%d')}.csv"
+        df_res.to_csv(out_file, index=False)
     print(f"Hasil disimpan ke: {out_file}")
     return df_res
+
 
 if __name__ == "__main__":
     run_screener_v4()
