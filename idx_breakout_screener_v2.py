@@ -87,7 +87,7 @@ PARAMS = {
     "risk_per_trade_pct": 1.0,
     "lot_size": 100,
     # --- False breakout filter ---
-    "require_liquidity_sweep": True,   # True = wajib ada sweep di res
+    "require_liquidity_sweep": False,   # True = wajib ada sweep di res
     "sweep_lookback": 12,              # cari sweep dalam N hari
     "sweep_min_wick_pct": 0.25,        # minimal wick di atas res (%)
     "min_breakout_vol_ratio": 1.25,    # volume untuk momentum BO
