@@ -1,22 +1,8 @@
 """
-IDX SMC SCREENER V4 — ORDER BLOCK & FVG DETECTION
+IDX SMC SCREENER V4 — ORDER BLOCK & FVG
 ============================================================
-Versi awal (aturan original) + bug diperbaiki.
-
-Aturan (tetap sama dengan original):
-1. Ambil Order Block paling baru
-2. Jarak maksimal dari OB Top = 3%
-3. Mitigation: Low masuk ke OB dan Close masih di atas OB Bottom
-4. RR minimum 1.5
-
-Bug yang diperbaiki:
-- bos_idx sekarang absolut (Target Liquidity tidak loncat jauh)
-- MultiIndex & data guard
-- Download lebih stabil
-
-Aturan original + bug index fixed + SL hybrid kondisional:
-- Jika jarak invalidasi (OB bottom) ≤ max_sl_pct → ATR boleh memperketat
-- Jika di luar range → SL = struktur murni (OB_bottom × buffer)
++ SL hybrid kondisional (struct / struct+atr)
++ Estimasi sesi ke Target Liquidity (ATR × momentum k)
 """
 
 from __future__ import annotations
@@ -27,14 +13,11 @@ import yfinance as yf
 from datetime import datetime
 from idx_liquidity_scanner import IdxLiquidityScanner
 
-# =========================================================================
-# PARAMETER SL
-# =========================================================================
 SL_PARAMS = {
     "atr_period": 14,
-    "sl_struct_buf": 0.015,   # 1.5% di bawah OB bottom
+    "sl_struct_buf": 0.015,
     "sl_atr_mult": 1.2,
-    "max_sl_pct": 3.5,        # ambang "masuk range"
+    "max_sl_pct": 3.5,
 }
 
 # =========================================================================
@@ -74,6 +57,37 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> float:
     return val if val == val and val > 0 else 0.0
 
 
+def compute_adx(df: pd.DataFrame, period: int = 14):
+    high, low, close = df["High"], df["Low"], df["Close"]
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    prev_c = close.shift(1)
+    tr = pd.concat(
+        [high - low, (high - prev_c).abs(), (low - prev_c).abs()], axis=1
+    ).max(axis=1)
+    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(
+        alpha=1 / period, adjust=False
+    ).mean() / atr.replace(0, np.nan)
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(
+        alpha=1 / period, adjust=False
+    ).mean() / atr.replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = dx.ewm(alpha=1 / period, adjust=False).mean()
+    return (
+        float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 0.0,
+        float(plus_di.iloc[-1]) if not pd.isna(plus_di.iloc[-1]) else 0.0,
+        float(minus_di.iloc[-1]) if not pd.isna(minus_di.iloc[-1]) else 0.0,
+    )
+
+
+def compute_roc(series: pd.Series, period: int = 10) -> float:
+    val = series.pct_change(periods=period).iloc[-1]
+    return float(val * 100) if not pd.isna(val) else 0.0
+
+
 def stop_loss_struct_with_optional_atr(
     entry: float,
     struct_level: float,
@@ -81,11 +95,6 @@ def stop_loss_struct_with_optional_atr(
     prev_close: float,
     params: dict,
 ) -> tuple[int, str]:
-    """
-    Masuk range (jarak struct ≤ max_sl_pct) → ATR boleh memperketat.
-    Luar range → prinsip awal (struktur × buffer).
-    ATR tidak pernah menaruh SL di bawah struktur.
-    """
     buf = params.get("sl_struct_buf", 0.015)
     k = params.get("sl_atr_mult", 1.2)
     max_sl_pct = params.get("max_sl_pct", 3.5)
@@ -98,7 +107,7 @@ def stop_loss_struct_with_optional_atr(
 
     if dist_pct <= max_sl_pct and atr and atr > 0:
         sl_atr = entry - k * atr
-        stop_raw = max(sl_struct, sl_atr)  # tidak di bawah struktur
+        stop_raw = max(sl_struct, sl_atr)
         source = "struct+atr"
     else:
         stop_raw = sl_struct
@@ -116,8 +125,48 @@ def stop_loss_struct_with_optional_atr(
     return int(stop), source
 
 
+def estimate_days_to_target(
+    entry: float,
+    target: float,
+    atr: float,
+    adx: float = 0.0,
+    plus_di: float = 0.0,
+    minus_di: float = 0.0,
+    vol_ratio: float = 1.0,
+    roc10: float = 0.0,
+):
+    """
+    Estimasi sesi bursa ke target liquidity.
+    Returns: (eta, eta_fast, eta_slow, k_used) atau (None,...)
+    """
+    dist = float(target) - float(entry)
+    if dist <= 0 or not atr or atr <= 0:
+        return None, None, None, None
+
+    k = 0.35
+    if adx > 25 and plus_di > minus_di:
+        k += 0.15
+    elif adx > 20 and plus_di > minus_di:
+        k += 0.08
+    if vol_ratio >= 1.3:
+        k += 0.10
+    elif vol_ratio >= 1.1:
+        k += 0.05
+    if roc10 > 5:
+        k += 0.12
+    elif roc10 > 2:
+        k += 0.06
+    k = max(0.25, min(0.90, k))
+
+    eta = dist / (k * atr)
+    eta_fast = dist / (min(0.90, k * 1.25) * atr)
+    eta_slow = dist / (max(0.25, k * 0.75) * atr)
+
+    return round(eta, 1), round(eta_fast, 1), round(eta_slow, 1), round(k, 2)
+
+
 # =========================================================================
-# SMC — OB / FVG
+# SMC ZONES
 # =========================================================================
 def detect_smc_zones(df: pd.DataFrame, lookback: int = 60):
     if len(df) < 15:
@@ -208,7 +257,7 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
             except Exception:
                 return None
 
-    if any(c not in df.columns for c in ["Open", "High", "Low", "Close"]):
+    if any(c not in df.columns for c in ["Open", "High", "Low", "Close", "Volume"]):
         return None
 
     df = df.dropna()
@@ -255,6 +304,27 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
     if rr_ratio < 1.5:
         return None
 
+    # --- Momentum untuk ETA ---
+    vol = df["Volume"]
+    avg_vol_20 = float(vol.tail(20).mean()) if len(vol) >= 20 else float(vol.mean())
+    vol_ratio = (
+        float(vol.tail(5).mean()) / avg_vol_20 if avg_vol_20 and avg_vol_20 > 0 else 1.0
+    )
+    adx, plus_di, minus_di = compute_adx(df, 14)
+    roc10 = compute_roc(df["Close"], 10)
+
+    eta, eta_fast, eta_slow, k_used = estimate_days_to_target(
+        entry=entry,
+        target=target_1,
+        atr=atr,
+        adx=adx,
+        plus_di=plus_di,
+        minus_di=minus_di,
+        vol_ratio=vol_ratio,
+        roc10=roc10,
+    )
+    dist_to_target = max(0.0, float(target_1) - float(entry))
+
     risk_rp = account_size * (risk_pct / 100.0)
     shares = int(risk_rp / risk_per_share) if risk_per_share > 0 else 0
     lots = shares // 100
@@ -270,7 +340,15 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
         "SL_Source": sl_src,
         "ATR": round(atr, 0),
         "Target(Liquidity)": target_1,
+        "DistToTarget": round(dist_to_target, 0),
         "RR_Ratio": round(rr_ratio, 2),
+        "ETA_Sesi": eta,
+        "ETA_Cepat": eta_fast,
+        "ETA_Lambat": eta_slow,
+        "MomentumK": k_used,
+        "ADX": round(adx, 1),
+        "VolRatio": round(vol_ratio, 2),
+        "ROC10": round(roc10, 2),
         "Lots": lots,
         "EstLoss(Rp)": round(actual_shares * risk_per_share, 0),
         "EstProfit(Rp)": round(actual_shares * (target_1 - entry), 0),
@@ -303,11 +381,29 @@ def run_screener_v4(user_params: dict = None):
         return None
 
     df_res = pd.DataFrame(results).sort_values("RR_Ratio", ascending=False)
-    print("\n" + "=" * 90)
-    print("SMC ORDER BLOCK SCREENER V4")
-    print("=" * 90)
-    print(df_res.to_string(index=False))
-    print("=" * 90)
+
+    show_cols = [
+        "Ticker", "Close", "Entry", "StopLoss", "Target(Liquidity)",
+        "DistToTarget", "RR_Ratio", "ETA_Sesi", "ETA_Cepat", "ETA_Lambat",
+        "MomentumK", "ATR", "ADX", "VolRatio", "SL_Source", "Lots",
+    ]
+    show_cols = [c for c in show_cols if c in df_res.columns]
+
+    print("\n" + "=" * 110)
+    print(f"SMC ORDER BLOCK SCREENER V4 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print("ETA_Sesi ≈ jarak target / (MomentumK × ATR) | satuan: sesi bursa (perkiraan)")
+    print("=" * 110)
+    print(df_res[show_cols].to_string(index=False))
+    print("=" * 110)
+
+    print("\nRINGKASAN ETA (TOP 5 RR)")
+    for _, row in df_res.head(5).iterrows():
+        print(
+            f"  {row['Ticker']}: target {row['Target(Liquidity)']} | "
+            f"ETA ~{row['ETA_Sesi']} sesi "
+            f"(cepat {row['ETA_Cepat']} / lambat {row['ETA_Lambat']}) | "
+            f"k={row['MomentumK']} ATR={row['ATR']}"
+        )
 
     df_res["Strategy"] = "V4 (SMC Order Block)"
     try:
@@ -316,7 +412,7 @@ def run_screener_v4(user_params: dict = None):
     except ImportError:
         out_file = f"idx_report_v4_{datetime.now().strftime('%Y-%m-%d')}.csv"
         df_res.to_csv(out_file, index=False)
-    print(f"Hasil disimpan ke: {out_file}")
+    print(f"\nHasil disimpan ke: {out_file}")
     return df_res
 
 

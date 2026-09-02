@@ -24,7 +24,7 @@ st.set_page_config(
 )
 
 st.title("📈 IDX Master Screener AI Dashboard")
-st.markdown("Analisa IHSG + screener Breakout, Retest Fibo, Order Block, CHOCH.")
+st.markdown("Analisa IHSG + screener Breakout, Retest, OB, CHOCH, Intraday, HighBeta, Accumulation.")
 
 # =====================================================================
 # SIDEBAR
@@ -79,6 +79,8 @@ mode = st.sidebar.radio(
         "V4 — Order Block",
         "V5 — CHOCH",
         "⚡ Intraday — Confluence",
+        "🔥 HighBeta — Spekulatif Likuid",
+        "📦 Accumulation — Late Base",
     ],
 )
 run_button = st.sidebar.button("▶️ JALANKAN", width="stretch", type="primary")
@@ -139,6 +141,14 @@ def run_intraday(p):
     m = importlib.import_module("idx_intraday_screener")
     m.run_intraday_screener(user_params=p)
 
+def run_highbeta(p):
+    m = importlib.import_module("idx_highbeta_screener")
+    m.run_highbeta_screener(user_params=p)
+
+def run_accumulation(p):
+    m = importlib.import_module("idx_accumulation_screener")
+    m.run_accumulation_screener(user_params=p)
+
 def enrich_all_version_csvs(broker_buy_pct, broker_sell_pct):
     """Enrich idx_report_v*_hari_ini: trailing + fundamental + biaya/pajak."""
     try:
@@ -159,7 +169,7 @@ def enrich_all_version_csvs(broker_buy_pct, broker_sell_pct):
         return
 
     today = datetime.now().strftime("%Y-%m-%d")
-    for ver in ["v2", "v3", "v4", "v5", "intraday"]:
+    for ver in ["v2", "v3", "v4", "v5", "intraday", "highbeta", "accumulation"]:
         # cari di beberapa path
         path = None
         for d in _search_dirs():
@@ -362,7 +372,10 @@ if run_button:
             ok, err, log = capture_run(run_v5, params)
         elif mode.startswith("⚡"):
             ok, err, log = capture_run(run_intraday, params)
-        
+        elif mode.startswith("🔥") or "HighBeta" in mode:
+            ok, err, log = capture_run(run_highbeta, params)
+        elif mode.startswith("📦") or "Accumulation" in mode:
+            ok, err, log = capture_run(run_accumulation, params)
         else:
             ok, err, log = False, "Mode tidak dikenal", ""
 
@@ -441,7 +454,10 @@ else:
             f"Setup — V2: **{counts.get('v2', 0)}** · "
             f"V3: **{counts.get('v3', 0)}** · "
             f"V4: **{counts.get('v4', 0)}** · "
-            f"V5: **{counts.get('v5', 0)}**"
+            f"V5: **{counts.get('v5', 0)}** · "
+            f"Intra: **{counts.get('intraday', 0)}** · "
+            f"HighBeta: **{counts.get('highbeta', 0)}** · "
+            f"Accum: **{counts.get('accumulation', 0)}**"
         )
 
     with st.expander("📋 Log run terakhir", expanded=False):
@@ -454,12 +470,14 @@ st.markdown("---")
 # =====================================================================
 st.subheader("📊 Hasil Screener per Strategi")
 
-t2, t3, t4, t5, t_intra = st.tabs([
+t2, t3, t4, t5, t_intra, t_hb, t_acc = st.tabs([
     "V2 Breakout",
     "V3 Retest Fibo",
     "V4 Order Block",
     "V5 CHOCH",
     "⚡ Intraday",
+    "🔥 HighBeta",
+    "📦 Accumulation",
 ])
 
 with t2:
@@ -472,6 +490,10 @@ with t5:
     show_report("v5", "V5 CHOCH")
 with t_intra:
     show_report("intraday", "Intraday Confluence")
+with t_hb:
+    show_report("highbeta", "HighBeta Liquid")
+with t_acc:
+    show_report("accumulation", "Accumulation Late/Early")
 
 st.markdown("---")
 st.caption("IDX Master Screener AI • Bukan rekomendasi investasi")
