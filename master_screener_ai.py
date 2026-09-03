@@ -2,7 +2,7 @@
 IDX MASTER SCREENER AI — ADAPTIVE MARKET REGIME
 ============================================================
 Orchestrator:
-  1. Analisa rezim IHSG
+  1. Analisa rezim IHSG + aktivitas pasar (RAMAI/NORMAL/SEPI)
   2. Jalankan strategi yang sesuai (V2–V5)
   3. Enrich hasil CSV per versi:
      - Trailing Stop
@@ -14,6 +14,12 @@ Rezim → Strategi:
   BULLISH_PULLBACK   → V3
   SIDEWAYS           → V3, V4
   BEARISH_WEAK/STRONG→ V5
+
+[UPDATE]
+- Aktivitas pasar: Volume ^JKSE sering 0 di Yahoo → validasi dulu;
+  fallback ke range 5D/20D + ATR ratio (bukan 0x palsu).
+- Indentasi blok activity diperbaiki.
+- Return lengkap untuk dashboard (activity, vol_ratio, range, atr_ratio).
 """
 
 from __future__ import annotations
@@ -66,14 +72,13 @@ def _search_dirs():
 
 
 def _find_today_report(version: str, day: str | None = None) -> str | None:
-    """Cari idx_report_v{N}_YYYY-MM-DD.csv di beberapa folder."""
+    """Cari idx_report_{version}_YYYY-MM-DD.csv di beberapa folder."""
     day = day or datetime.now().strftime("%Y-%m-%d")
     name = f"idx_report_{version}_{day}.csv"
     for d in _search_dirs():
         path = os.path.join(d, name)
         if os.path.exists(path):
             return path
-    # fallback: file versi apa pun yang paling baru
     files = []
     for d in _search_dirs():
         files.extend(glob.glob(os.path.join(d, f"idx_report_{version}_*.csv")))
@@ -82,8 +87,31 @@ def _find_today_report(version: str, day: str | None = None) -> str | None:
     return max(files, key=os.path.getmtime)
 
 
+def _compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series | None:
+    if not {"High", "Low", "Close"}.issubset(df.columns):
+        return None
+    h, l, c = df["High"], df["Low"], df["Close"]
+    prev = c.shift(1)
+    tr = pd.concat([h - l, (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def _volume_is_valid(vol: pd.Series, min_nonzero: int = 10) -> bool:
+    """Yahoo sering isi Volume=0 untuk ^JKSE — anggap invalid."""
+    if vol is None or vol.empty:
+        return False
+    v = vol.tail(20).replace(0, np.nan).dropna()
+    return len(v) >= min_nonzero and float(v.mean()) > 0
+
+
 def analyze_ihsg_regime(lookback_days: int = 180) -> dict:
-    """Analisa rezim IHSG (5 state + mapping strategi)."""
+    """
+    Analisa rezim IHSG (5 state) + aktivitas RAMAI/NORMAL/SEPI.
+
+    Aktivitas:
+      - Volume dipakai HANYA jika valid (bukan deret 0).
+      - Jika volume invalid → proxy range 5D vs 20D + ATR5/ATR14.
+    """
     print("\n" + "=" * 80)
     print("MENGANALISA REZIM PASAR IHSG SAAT INI (^JKSE)")
     print("=" * 80)
@@ -99,10 +127,22 @@ def analyze_ihsg_regime(lookback_days: int = 180) -> dict:
         )
     except Exception as e:
         print(f"Gagal mengambil data IHSG: {e}")
-        return {"regime": "UNKNOWN", "reason": ["Data IHSG tidak tersedia."], "strategies": []}
+        return {
+            "regime": "UNKNOWN",
+            "reason": ["Data IHSG tidak tersedia."],
+            "strategies": [],
+            "activity": "UNKNOWN",
+            "activity_reason": [],
+        }
 
     if df is None or df.empty:
-        return {"regime": "UNKNOWN", "reason": ["Data IHSG kosong."], "strategies": []}
+        return {
+            "regime": "UNKNOWN",
+            "reason": ["Data IHSG kosong."],
+            "strategies": [],
+            "activity": "UNKNOWN",
+            "activity_reason": [],
+        }
 
     if isinstance(df.columns, pd.MultiIndex):
         try:
@@ -114,11 +154,26 @@ def analyze_ihsg_regime(lookback_days: int = 180) -> dict:
                 pass
 
     if "Close" not in df.columns:
-        return {"regime": "UNKNOWN", "reason": ["Kolom Close tidak ditemukan."], "strategies": []}
+        return {
+            "regime": "UNKNOWN",
+            "reason": ["Kolom Close tidak ditemukan."],
+            "strategies": [],
+            "activity": "UNKNOWN",
+            "activity_reason": [],
+        }
 
-    close = df["Close"].dropna()
+    # Pakai bar yang punya Close; jaga High/Low/Volume sejajar
+    df = df.copy()
+    df = df[df["Close"].notna()]
+    close = df["Close"]
     if len(close) < 100:
-        return {"regime": "UNKNOWN", "reason": ["Data tidak cukup (<100 bar)."], "strategies": []}
+        return {
+            "regime": "UNKNOWN",
+            "reason": ["Data tidak cukup (<100 bar)."],
+            "strategies": [],
+            "activity": "UNKNOWN",
+            "activity_reason": [],
+        }
 
     ma20 = close.rolling(20).mean()
     ma50 = close.rolling(50).mean()
@@ -130,7 +185,13 @@ def analyze_ihsg_regime(lookback_days: int = 180) -> dict:
     last_ma100 = float(ma100.iloc[-1])
 
     if any(pd.isna(x) for x in [last_ma20, last_ma50, last_ma100]):
-        return {"regime": "UNKNOWN", "reason": ["MA mengandung NaN."], "strategies": []}
+        return {
+            "regime": "UNKNOWN",
+            "reason": ["MA mengandung NaN."],
+            "strategies": [],
+            "activity": "UNKNOWN",
+            "activity_reason": [],
+        }
 
     ma20_prev = float(ma20.iloc[-6]) if len(ma20) >= 6 else last_ma20
     ma50_prev = float(ma50.iloc[-6]) if len(ma50) >= 6 else last_ma50
@@ -139,16 +200,28 @@ def analyze_ihsg_regime(lookback_days: int = 180) -> dict:
     ma20_falling = last_ma20 < ma20_prev
     ma50_falling = last_ma50 < ma50_prev
 
-    high_20 = float(close.tail(20).max())
-    low_20 = float(close.tail(20).min())
-    high_60 = float(close.tail(60).max()) if len(close) >= 60 else high_20
-    low_60 = float(close.tail(60).min()) if len(close) >= 60 else low_20
+    # High/Low lebih akurat dari kolom High/Low jika ada
+    if "High" in df.columns and "Low" in df.columns:
+        high_20 = float(df["High"].tail(20).max())
+        low_20 = float(df["Low"].tail(20).min())
+        high_60 = float(df["High"].tail(60).max()) if len(df) >= 60 else high_20
+        low_60 = float(df["Low"].tail(60).min()) if len(df) >= 60 else low_20
+        high_5 = float(df["High"].tail(5).max())
+        low_5 = float(df["Low"].tail(5).min())
+    else:
+        high_20 = float(close.tail(20).max())
+        low_20 = float(close.tail(20).min())
+        high_60 = float(close.tail(60).max()) if len(close) >= 60 else high_20
+        low_60 = float(close.tail(60).min()) if len(close) >= 60 else low_20
+        high_5 = float(close.tail(5).max())
+        low_5 = float(close.tail(5).min())
 
     dist_to_high_20 = (high_20 - last_close) / last_close * 100
     dist_to_low_20 = (last_close - low_20) / low_20 * 100
     dist_to_high_60 = (high_60 - last_close) / last_close * 100
     dist_to_low_60 = (last_close - low_60) / low_60 * 100
     range_20_pct = (high_20 - low_20) / last_close * 100
+    range_5_pct = (high_5 - low_5) / last_close * 100
 
     bullish_stack = last_close > last_ma20 > last_ma50 > last_ma100
     above_ma50 = last_close > last_ma50
@@ -156,6 +229,9 @@ def analyze_ihsg_regime(lookback_days: int = 180) -> dict:
     below_ma50 = last_close < last_ma50
     below_ma20 = last_close < last_ma20
 
+    # =================================================================
+    # REZIM
+    # =================================================================
     regime = "SIDEWAYS"
     reason: list[str] = []
     strategies: list[str] = []
@@ -177,7 +253,12 @@ def analyze_ihsg_regime(lookback_days: int = 180) -> dict:
         if ma50_rising:
             reason.append("MA50 masih naik — pullback dalam uptrend.")
         strategies = ["V3"]
-    elif below_ma20 and below_ma50 and (ma20_falling or ma50_falling) and dist_to_low_20 <= 5.0:
+    elif (
+        below_ma20
+        and below_ma50
+        and (ma20_falling or ma50_falling)
+        and dist_to_low_20 <= 5.0
+    ):
         regime = "BEARISH_STRONG"
         reason += [
             "Downtrend: Close < MA20 & MA50.",
@@ -204,81 +285,125 @@ def analyze_ihsg_regime(lookback_days: int = 180) -> dict:
             reason.append("Tidak ada tren bullish/bearish yang jelas (rotasi sektor).")
         strategies = ["V3", "V4"]
 
-     # --- Aktivitas pasar (ramai / sepi) ---
+    # =================================================================
+    # AKTIVITAS PASAR (RAMAI / NORMAL / SEPI)
+    # Volume ^JKSE sering 0 di Yahoo → jangan pakai angka 0x palsu
+    # =================================================================
     activity = "NORMAL"
-    activity_reason = []
+    activity_reason: list[str] = []
     vol_ratio_20 = None
-    range_5_pct = None
+    vol_ratio_5 = None
+    atr_ratio = None
+    score = 0
 
+    # --- Volume (opsional) ---
+    vol_valid = False
     if "Volume" in df.columns:
-        vol = df["Volume"].reindex(close.index).fillna(0)
-        # sejajarkan dengan close yang sudah dropna
-        vol = vol.loc[close.index]
-        avg_vol_20 = float(vol.tail(20).mean()) if len(vol) >= 20 else 0.0
-        last_vol = float(vol.iloc[-1])
-        avg_vol_5 = float(vol.tail(5).mean()) if len(vol) >= 5 else last_vol
+        vol = pd.to_numeric(df["Volume"], errors="coerce").fillna(0.0)
+        if _volume_is_valid(vol):
+            vol_valid = True
+            avg_vol_20 = float(vol.tail(20).replace(0, np.nan).mean())
+            avg_vol_5 = float(vol.tail(5).replace(0, np.nan).mean())
+            last_vol = float(vol.iloc[-1]) if float(vol.iloc[-1]) > 0 else avg_vol_5
+            if avg_vol_20 > 0:
+                vol_ratio_20 = last_vol / avg_vol_20
+                vol_ratio_5 = avg_vol_5 / avg_vol_20
 
-        if avg_vol_20 > 0:
-            vol_ratio_20 = last_vol / avg_vol_20
-            vol_ratio_5 = avg_vol_5 / avg_vol_20
-        else:
-            vol_ratio_20 = 1.0
-            vol_ratio_5 = 1.0
-    else:
-        vol_ratio_20 = 1.0
-        vol_ratio_5 = 1.0
-        activity_reason.append("Volume IHSG tidak tersedia di feed — aktivitas diestimasi dari range saja.")
-
-    # Range 5 hari vs range 20 hari (ekspansi = lebih ramai)
-    high_5 = float(close.tail(5).max())
-    low_5 = float(close.tail(5).min())
-    range_5_pct = (high_5 - low_5) / last_close * 100 if last_close else 0.0
-    # range_20_pct sudah dihitung di atas
-
-    range_expanding = range_5_pct >= (range_20_pct * 0.45) and range_5_pct >= 1.5
-    range_tight = range_20_pct <= 4.0 or range_5_pct <= 1.2
-
-    if vol_ratio_20 is not None and vol_ratio_20 >= 1.25:
-        activity = "RAMAI"
-        activity_reason.append(f"Volume IHSG tinggi ({vol_ratio_20:.2f}x avg 20 hari).")
-    elif vol_ratio_20 is not None and vol_ratio_5 >= 1.20:
-        activity = "RAMAI"
-        activity_reason.append(f"Volume 5 hari masih di atas rata-rata ({vol_ratio_5:.2f}x).")
-    elif vol_ratio_20 is not None and vol_ratio_20 <= 0.75 and range_tight:
-        activity = "SEPI"
+    if not vol_valid:
         activity_reason.append(
-            f"Volume rendah ({vol_ratio_20:.2f}x avg) + range sempit — pasar lesu."
+            "Volume ^JKSE tidak valid (sering 0 di Yahoo) — aktivitas memakai range/ATR."
         )
-    elif vol_ratio_20 is not None and vol_ratio_20 <= 0.70:
+    else:
+        if vol_ratio_20 is not None and vol_ratio_20 >= 1.25:
+            score += 2
+            activity_reason.append(
+                f"Volume terakhir tinggi ({vol_ratio_20:.2f}x avg20)."
+            )
+        elif vol_ratio_5 is not None and vol_ratio_5 >= 1.20:
+            score += 1
+            activity_reason.append(
+                f"Volume 5 hari di atas rata-rata ({vol_ratio_5:.2f}x avg20)."
+            )
+        elif vol_ratio_20 is not None and vol_ratio_20 <= 0.70:
+            score -= 2
+            activity_reason.append(
+                f"Volume lemah ({vol_ratio_20:.2f}x avg20)."
+            )
+        elif vol_ratio_20 is not None and vol_ratio_20 <= 0.85:
+            score -= 1
+            activity_reason.append(
+                f"Volume di bawah rata-rata ({vol_ratio_20:.2f}x avg20)."
+            )
+        else:
+            activity_reason.append(
+                f"Volume relatif normal ({vol_ratio_20:.2f}x avg20)."
+            )
+
+    # --- Range proxy ---
+    # range 5 hari relatif aktif vs skala range 20 hari
+    range_expanding = range_5_pct >= max(1.5, range_20_pct * 0.55)
+    range_tight = range_5_pct <= 1.2 and range_20_pct <= 5.0
+
+    if range_expanding:
+        score += 1
+        activity_reason.append(
+            f"Range 5D melebar ({range_5_pct:.2f}% vs range20 {range_20_pct:.2f}%)."
+        )
+    elif range_tight:
+        score -= 1
+        activity_reason.append(
+            f"Pergerakan sempit (range5 {range_5_pct:.2f}%, range20 {range_20_pct:.2f}%)."
+        )
+
+    # --- ATR proxy ---
+    atr14 = _compute_atr(df, 14)
+    atr5 = _compute_atr(df, 5)
+    if atr14 is not None and atr5 is not None:
+        a14 = float(atr14.iloc[-1]) if not pd.isna(atr14.iloc[-1]) else 0.0
+        a5 = float(atr5.iloc[-1]) if not pd.isna(atr5.iloc[-1]) else 0.0
+        if a14 > 0 and a5 > 0:
+            atr_ratio = a5 / a14
+            if atr_ratio >= 1.20:
+                score += 1
+                activity_reason.append(
+                    f"Volatilitas naik (ATR5/ATR14={atr_ratio:.2f})."
+                )
+            elif atr_ratio <= 0.80:
+                score -= 1
+                activity_reason.append(
+                    f"Volatilitas turun (ATR5/ATR14={atr_ratio:.2f})."
+                )
+
+    if score >= 2:
+        activity = "RAMAI"
+    elif score <= -2:
         activity = "SEPI"
-        activity_reason.append(f"Volume IHSG lemah ({vol_ratio_20:.2f}x avg 20 hari).")
     else:
         activity = "NORMAL"
-        activity_reason.append(
-            f"Volume relatif normal"
-            + (f" ({vol_ratio_20:.2f}x avg)" if vol_ratio_20 else "")
-            + "."
-        )
 
-    if range_expanding and activity != "SEPI":
-        if activity == "NORMAL":
-            activity = "RAMAI"
-        activity_reason.append(
-            f"Range 5 hari melebar ({range_5_pct:.1f}% vs range 20D {range_20_pct:.1f}%)."
-        )
-    elif range_tight and activity == "NORMAL":
-        activity_reason.append(f"Pergerakan sempit (range 5D {range_5_pct:.1f}%).")
-
+    # --- Output terminal ---
     print(f"Index Terakhir : {last_close:,.2f}")
-    print(f"Status MA      : MA20={last_ma20:,.0f} | MA50={last_ma50:,.0f} | MA100={last_ma100:,.0f}")
-    print(f"Slope MA       : MA20={'naik' if ma20_rising else 'turun'} | MA50={'naik' if ma50_rising else 'turun'}")
+    print(
+        f"Status MA      : MA20={last_ma20:,.0f} | "
+        f"MA50={last_ma50:,.0f} | MA100={last_ma100:,.0f}"
+    )
+    print(
+        f"Slope MA       : MA20={'naik' if ma20_rising else 'turun'} | "
+        f"MA50={'naik' if ma50_rising else 'turun'}"
+    )
     print(f"Dist High20/60 : {dist_to_high_20:.1f}% / {dist_to_high_60:.1f}%")
     print(f"Dist Low20/60  : {dist_to_low_20:.1f}% / {dist_to_low_60:.1f}%")
-    print(f"Range 20 hari  : {range_20_pct:.1f}%")
+    print(f"Range 5/20 hari: {range_5_pct:.2f}% / {range_20_pct:.2f}%")
+    if vol_valid and vol_ratio_20 is not None:
+        print(f"Vol ratio      : {vol_ratio_20:.2f}x avg20 (valid)")
+    else:
+        print("Vol ratio      : n/a (volume indeks tidak valid)")
+    if atr_ratio is not None:
+        print(f"ATR5/ATR14     : {atr_ratio:.2f}")
     print(f"Rezim Pasar    : ** {regime} **")
     for r in reason:
         print(f"  - {r}")
-    print(f"Aktivitas     : ** {activity} **")
+    print(f"Aktivitas      : ** {activity} ** (score={score})")
     for r in activity_reason:
         print(f"  - {r}")
     print(f"Strategi       : {', '.join(strategies)}")
@@ -291,12 +416,13 @@ def analyze_ihsg_regime(lookback_days: int = 180) -> dict:
         "ma50": last_ma50,
         "ma100": last_ma100,
         "reason": reason,
-        # baru
-        "activity": activity,                 # RAMAI | NORMAL | SEPI
+        "activity": activity,
         "activity_reason": activity_reason,
         "vol_ratio_20": round(vol_ratio_20, 2) if vol_ratio_20 is not None else None,
-        "range_5_pct": round(range_5_pct, 2) if range_5_pct is not None else None,
+        "range_5_pct": round(range_5_pct, 2),
         "range_20_pct": round(range_20_pct, 2),
+        "atr_ratio": round(atr_ratio, 2) if atr_ratio is not None else None,
+        "activity_score": score,
     }
 
 
@@ -304,13 +430,13 @@ def apply_enrichment_to_latest_reports(
     broker_buy_pct: float = 0.15,
     broker_sell_pct: float = 0.25,
 ):
-    """Trailing + fundamental + biaya/pajak pada idx_report_v2..v5."""
+    """Trailing + fundamental + biaya/pajak pada report versi yang ada."""
     print("\n" + "=" * 80)
     print("ENRICHMENT: Trailing + Fundamental + Biaya/Pajak")
     print("=" * 80)
     print(f"  Fee beli={broker_buy_pct}% | Fee jual={broker_sell_pct}%")
 
-    for ver in ["v2", "v3", "v4", "v5"]:
+    for ver in ["v2", "v3", "v4", "v5", "intraday", "highbeta", "accumulation"]:
         fpath = _find_today_report(ver)
         if not fpath:
             print(f"  • {ver.upper()}: file tidak ada, dilewati.")
@@ -348,7 +474,6 @@ def run_orchestrator(
     print("IDX MASTER SCREENER AI - SETUP MODAL, RISIKO & FEE")
     print("=" * 80)
 
-    # Input interaktif hanya jika dipanggil tanpa argumen (CLI)
     if account_size is None or risk_pct is None:
         try:
             raw_modal = input(
@@ -393,8 +518,10 @@ def run_orchestrator(
         f"Risiko/Trade: {risk_pct}% "
         f"(Maks Rugi: Rp {account_size * risk_pct / 100:,.0f})"
     )
-    print(f"[SETUP] Fee beli: {broker_buy_pct}% | Fee jual: {broker_sell_pct}% "
-          f"(+ PPN 12% atas fee, levy ~0.043%, PPh Final 0.1% jual)")
+    print(
+        f"[SETUP] Fee beli: {broker_buy_pct}% | Fee jual: {broker_sell_pct}% "
+        f"(+ PPN 12% atas fee, levy ~0.043%, PPh Final 0.1% jual)"
+    )
 
     market_status = analyze_ihsg_regime()
     strategies = market_status.get("strategies", [])
@@ -405,6 +532,10 @@ def run_orchestrator(
 
     print("\n" + "=" * 80)
     print(f"REKOMENDASI AI: MENJALANKAN STRATEGI {', '.join(strategies)}")
+    print(
+        f"Rezim={market_status.get('regime')} | "
+        f"Aktivitas={market_status.get('activity')}"
+    )
     print("=" * 80)
 
     user_params = {

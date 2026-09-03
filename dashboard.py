@@ -1,8 +1,8 @@
 """
 IDX Master Screener AI — Streamlit Dashboard
 - Panel rezim IHSG (on-demand)
-- Jalankan AI adaptive / V2 / V3 / V4 / V5
-- Tab hasil per strategi (idx_report_v2..v5)
+- Jalankan AI adaptive / V2–V5 / Intraday / HighBeta / Accumulation / Confluence
+- Tab hasil per strategi
 - Komisi + pajak (enrich lewat master / fallback)
 - Status run terakhir
 - Download CSV + freeze Ticker
@@ -24,7 +24,22 @@ st.set_page_config(
 )
 
 st.title("📈 IDX Master Screener AI Dashboard")
-st.markdown("Analisa IHSG + screener Breakout, Retest, OB, CHOCH, Intraday, HighBeta, Accumulation.")
+st.markdown(
+    "Analisa IHSG + screener Breakout, Retest, OB, CHOCH, Intraday, "
+    "HighBeta, Accumulation, Confluence."
+)
+
+# Semua kunci report yang dikenali dashboard
+REPORT_VERSIONS = [
+    "v2",
+    "v3",
+    "v4",
+    "v5",
+    "intraday",
+    "highbeta",
+    "accumulation",
+    "confluence",
+]
 
 # =====================================================================
 # SIDEBAR
@@ -81,8 +96,19 @@ mode = st.sidebar.radio(
         "⚡ Intraday — Confluence",
         "🔥 HighBeta — Spekulatif Likuid",
         "📦 Accumulation — Late Base",
+        "🎯 Confluence — Top Overlap",
     ],
 )
+
+if mode.startswith("🎯"):
+    st.sidebar.caption(
+        "Menjalankan semua screener lalu mengambil Top 5 ticker "
+        "yang muncul di ≥2 strategi. Memakan waktu lebih lama."
+    )
+    skip_cf = st.sidebar.checkbox("Hanya baca CSV existing (skip run)", value=False)
+else:
+    skip_cf = False
+
 run_button = st.sidebar.button("▶️ JALANKAN", width="stretch", type="primary")
 
 
@@ -130,6 +156,7 @@ def run_v5(p):
 
 def run_ai(account_size, risk_pct, broker_buy_pct, broker_sell_pct):
     import master_screener_ai
+
     master_screener_ai.run_orchestrator(
         account_size=float(account_size),
         risk_pct=float(risk_pct),
@@ -137,22 +164,32 @@ def run_ai(account_size, risk_pct, broker_buy_pct, broker_sell_pct):
         broker_sell_pct=float(broker_sell_pct),
     )
 
+
 def run_intraday(p):
     m = importlib.import_module("idx_intraday_screener")
     m.run_intraday_screener(user_params=p)
+
 
 def run_highbeta(p):
     m = importlib.import_module("idx_highbeta_screener")
     m.run_highbeta_screener(user_params=p)
 
+
 def run_accumulation(p):
     m = importlib.import_module("idx_accumulation_screener")
     m.run_accumulation_screener(user_params=p)
 
+
+def run_confluence(p, skip_run=False):
+    m = importlib.import_module("idx_confluence_runner")
+    m.run_confluence(params=p, top_n=5, skip_run=skip_run)
+
+
 def enrich_all_version_csvs(broker_buy_pct, broker_sell_pct):
-    """Enrich idx_report_v*_hari_ini: trailing + fundamental + biaya/pajak."""
+    """Enrich report hari ini: trailing + fundamental + biaya/pajak."""
     try:
         import master_screener_ai
+
         if hasattr(master_screener_ai, "apply_enrichment_to_latest_reports"):
             master_screener_ai.apply_enrichment_to_latest_reports(
                 broker_buy_pct=float(broker_buy_pct),
@@ -162,15 +199,14 @@ def enrich_all_version_csvs(broker_buy_pct, broker_sell_pct):
     except Exception:
         pass
 
-    # Fallback lokal
     try:
         from idx_cost_tax import enrich_dataframe_with_costs
     except ImportError:
         return
 
     today = datetime.now().strftime("%Y-%m-%d")
+    # confluence = agregat ranking; skip enrich biaya per-setup
     for ver in ["v2", "v3", "v4", "v5", "intraday", "highbeta", "accumulation"]:
-        # cari di beberapa path
         path = None
         for d in _search_dirs():
             cand = os.path.join(d, f"idx_report_{ver}_{today}.csv")
@@ -185,11 +221,13 @@ def enrich_all_version_csvs(broker_buy_pct, broker_sell_pct):
                 continue
             try:
                 from idx_trailing_stop import enrich_with_trailing_stop
+
                 df = enrich_with_trailing_stop(df)
             except Exception:
                 pass
             try:
                 from idx_fundamental import enrich_with_fundamental
+
                 df = enrich_with_fundamental(df)
             except Exception:
                 pass
@@ -210,7 +248,11 @@ def _search_dirs():
             dirs.append(here)
     except Exception:
         pass
-    for extra in ["/home/workdir", "/home/workdir/artifacts", "/home/workdir/attachments"]:
+    for extra in [
+        "/home/workdir",
+        "/home/workdir/artifacts",
+        "/home/workdir/attachments",
+    ]:
         if os.path.isdir(extra) and extra not in dirs:
             dirs.append(extra)
     return dirs
@@ -225,12 +267,22 @@ def find_report(version: str):
     return max(files, key=os.path.getmtime)
 
 
+def count_report_rows(version: str) -> int:
+    path = find_report(version)
+    if not path or not os.path.exists(path):
+        return 0
+    try:
+        return len(pd.read_csv(path))
+    except Exception:
+        return 0
+
+
 def show_report(version: str, title: str):
     path = find_report(version)
     if not path:
         st.info(
             f"Belum ada data **{title}**. "
-            f"Jalankan screener **{version.upper()}** atau **AI Adaptive**."
+            f"Jalankan screener terkait atau **AI Adaptive** / **Confluence**."
         )
         return
 
@@ -274,6 +326,7 @@ if cek_rezim:
     with st.spinner("Mengambil data IHSG..."):
         try:
             import master_screener_ai
+
             st.session_state["ihsg_regime"] = master_screener_ai.analyze_ihsg_regime()
         except Exception as e:
             st.session_state["ihsg_regime"] = {
@@ -320,6 +373,8 @@ if reg.get("vol_ratio_20") is not None:
         f"Range5: {reg.get('range_5_pct', '-')}% · "
         f"Range20: {reg.get('range_20_pct', '-')}%"
     )
+elif reg.get("activity_reason"):
+    st.caption("Vol IHSG: n/a (data volume indeks sering tidak valid di Yahoo)")
 
 mc = st.columns(4)
 if reg.get("last_close"):
@@ -351,15 +406,23 @@ if run_button:
     label = mode
     started_at = datetime.now()
 
-    with st.spinner(f"Menjalankan {label}... (1–3 menit)"):
+    spinner_msg = f"Menjalankan {label}..."
+    if mode.startswith("🎯") and not skip_cf:
+        spinner_msg += " (semua strategi — bisa 5–15 menit)"
+    else:
+        spinner_msg += " (1–3 menit)"
+
+    with st.spinner(spinner_msg):
         if mode.startswith("🤖"):
-            # [FIX] teruskan fee ke master
             ok, err, log = capture_run(
                 run_ai, account_size, risk_pct, broker_buy, broker_sell
             )
             try:
                 import master_screener_ai
-                st.session_state["ihsg_regime"] = master_screener_ai.analyze_ihsg_regime()
+
+                st.session_state["ihsg_regime"] = (
+                    master_screener_ai.analyze_ihsg_regime()
+                )
             except Exception:
                 pass
         elif mode.startswith("V2"):
@@ -376,27 +439,19 @@ if run_button:
             ok, err, log = capture_run(run_highbeta, params)
         elif mode.startswith("📦") or "Accumulation" in mode:
             ok, err, log = capture_run(run_accumulation, params)
+        elif mode.startswith("🎯") or "Confluence" in mode:
+            ok, err, log = capture_run(run_confluence, params, skip_cf)
         else:
             ok, err, log = False, "Mode tidak dikenal", ""
 
-        # [FIX] Setelah run versi tunggal → enrich di satu tempat
-        # (AI Adaptive sudah enrich di dalam master)
+        # Enrich setelah run non-AI (termasuk setelah confluence menjalankan sub-screener)
         if ok and not mode.startswith("🤖"):
             enrich_all_version_csvs(broker_buy, broker_sell)
 
     finished_at = datetime.now()
     duration_sec = (finished_at - started_at).total_seconds()
 
-    counts = {}
-    for ver in ["v2", "v3", "v4", "v5", "intraday"]:
-        path = find_report(ver)
-        n = 0
-        if path and os.path.exists(path):
-            try:
-                n = len(pd.read_csv(path))
-            except Exception:
-                n = 0
-        counts[ver] = n
+    counts = {ver: count_report_rows(ver) for ver in REPORT_VERSIONS}
 
     st.session_state["last_run_status"] = {
         "ok": ok,
@@ -435,7 +490,6 @@ else:
     else:
         st.error(f"Status: **Gagal** — {status.get('error') or '-'}")
 
-    # Baris ringkas — font kecil via caption / markdown
     st.caption(
         f"**Mode:** {status.get('mode', '-')} · "
         f"**Durasi:** {status.get('duration_sec', 0)} dtk · "
@@ -451,13 +505,14 @@ else:
     counts = status.get("counts") or {}
     if counts:
         st.caption(
-            f"Setup — V2: **{counts.get('v2', 0)}** · "
-            f"V3: **{counts.get('v3', 0)}** · "
-            f"V4: **{counts.get('v4', 0)}** · "
-            f"V5: **{counts.get('v5', 0)}** · "
-            f"Intra: **{counts.get('intraday', 0)}** · "
-            f"HighBeta: **{counts.get('highbeta', 0)}** · "
-            f"Accum: **{counts.get('accumulation', 0)}**"
+            f"Setup — V2:**{counts.get('v2', 0)}** · "
+            f"V3:**{counts.get('v3', 0)}** · "
+            f"V4:**{counts.get('v4', 0)}** · "
+            f"V5:**{counts.get('v5', 0)}** · "
+            f"Intra:**{counts.get('intraday', 0)}** · "
+            f"HB:**{counts.get('highbeta', 0)}** · "
+            f"Acc:**{counts.get('accumulation', 0)}** · "
+            f"CF:**{counts.get('confluence', 0)}**"
         )
 
     with st.expander("📋 Log run terakhir", expanded=False):
@@ -470,30 +525,35 @@ st.markdown("---")
 # =====================================================================
 st.subheader("📊 Hasil Screener per Strategi")
 
-t2, t3, t4, t5, t_intra, t_hb, t_acc = st.tabs([
-    "V2 Breakout",
-    "V3 Retest Fibo",
-    "V4 Order Block",
-    "V5 CHOCH",
-    "⚡ Intraday",
-    "🔥 HighBeta",
-    "📦 Accumulation",
-])
+tabs = st.tabs(
+    [
+        "V2 Breakout",
+        "V3 Retest Fibo",
+        "V4 Order Block",
+        "V5 CHOCH",
+        "⚡ Intraday",
+        "🔥 HighBeta",
+        "📦 Accumulation",
+        "🎯 Confluence",
+    ]
+)
 
-with t2:
+with tabs[0]:
     show_report("v2", "V2 Breakout")
-with t3:
+with tabs[1]:
     show_report("v3", "V3 Retest Fibo")
-with t4:
+with tabs[2]:
     show_report("v4", "V4 Order Block")
-with t5:
+with tabs[3]:
     show_report("v5", "V5 CHOCH")
-with t_intra:
+with tabs[4]:
     show_report("intraday", "Intraday Confluence")
-with t_hb:
+with tabs[5]:
     show_report("highbeta", "HighBeta Liquid")
-with t_acc:
+with tabs[6]:
     show_report("accumulation", "Accumulation Late/Early")
+with tabs[7]:
+    show_report("confluence", "Confluence Top Overlap")
 
 st.markdown("---")
 st.caption("IDX Master Screener AI • Bukan rekomendasi investasi")
