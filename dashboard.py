@@ -6,16 +6,83 @@ IDX Master Screener AI — Streamlit Dashboard
 - Komisi + pajak (enrich lewat master / fallback)
 - Status run terakhir
 - Download CSV + freeze Ticker
+- AI Trader Assistant (auto-load .env + Streamlit secrets)
 """
 
-import streamlit as st
-import pandas as pd
 import os
 import glob
 import io
 import sys
 import importlib
 from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+
+
+def _load_local_env() -> None:
+    """Muat .env lokal ke os.environ (tidak override env yang sudah ada)."""
+    candidates = [
+        Path.cwd() / ".env",
+        Path(__file__).resolve().parent / ".env",
+        Path(__file__).resolve().parent.parent / ".env",
+    ]
+    try:
+        from dotenv import load_dotenv
+
+        for p in candidates:
+            if p.is_file():
+                load_dotenv(p, override=False)
+        return
+    except ImportError:
+        pass
+
+    for p in candidates:
+        if not p.is_file():
+            continue
+        try:
+            for raw in p.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip("'").strip('"')
+                if key and key not in os.environ:
+                    os.environ[key] = val
+        except Exception:
+            continue
+
+
+_load_local_env()
+
+import streamlit as st
+
+# Inject Streamlit secrets → env (Cloud / secrets.toml lokal)
+def _inject_streamlit_secrets() -> None:
+    try:
+        secrets = st.secrets
+    except Exception:
+        return
+    for key in (
+        "OPENAI_API_KEY",
+        "XAI_API_KEY",
+        "LLM_API_KEY",
+        "OPENAI_BASE_URL",
+        "XAI_BASE_URL",
+        "OPENAI_MODEL",
+        "XAI_MODEL",
+    ):
+        try:
+            if key in secrets and key not in os.environ:
+                os.environ[key] = str(secrets[key])
+        except Exception:
+            continue
+
+
+_inject_streamlit_secrets()
 
 st.set_page_config(
     page_title="IDX Master Screener Dashboard",
@@ -26,7 +93,7 @@ st.set_page_config(
 st.title("📈 IDX Master Screener AI Dashboard")
 st.markdown(
     "Analisa IHSG + screener Breakout, Retest, OB, CHOCH, Intraday, "
-    "HighBeta, Accumulation, Confluence."
+    "HighBeta, Accumulation, Confluence + **AI Trader Assistant**."
 )
 
 # Semua kunci report yang dikenali dashboard
@@ -556,4 +623,187 @@ with tabs[7]:
     show_report("confluence", "Confluence Top Overlap")
 
 st.markdown("---")
+
+# =====================================================================
+# AI TRADER ASSISTANT
+# =====================================================================
+st.subheader("🤖 AI Trader Assistant")
+st.caption(
+    "Pilih ticker dari hasil screener → multi-agent (technical / risk / critic / chief). "
+    "Bukan rekomendasi investasi."
+)
+
+try:
+    import idx_ai_assistant as ai_asst
+
+    AI_OK = True
+except ImportError:
+    AI_OK = False
+    ai_asst = None
+
+if not AI_OK:
+    st.warning(
+        "Modul `idx_ai_assistant.py` tidak ditemukan di folder project. "
+        "Tambahkan file tersebut lalu restart Streamlit."
+    )
+else:
+    offline = not ai_asst.llm_available()
+    if offline:
+        st.info(
+            "Mode **offline** (heuristik). Set secret/env "
+            "`OPENAI_API_KEY` atau `XAI_API_KEY` "
+            "(opsional `OPENAI_BASE_URL`, `OPENAI_MODEL`) untuk analisa LLM penuh."
+        )
+    else:
+        st.success("LLM API terdeteksi — agent akan memanggil model.")
+
+    ver_labels = {
+        "v2": "V2 Breakout",
+        "v3": "V3 Retest",
+        "v4": "V4 Order Block",
+        "v5": "V5 CHOCH",
+        "intraday": "Intraday",
+        "highbeta": "HighBeta",
+        "accumulation": "Accumulation",
+        "confluence": "Confluence",
+    }
+    ai_col1, ai_col2 = st.columns([1, 2])
+    with ai_col1:
+        ai_version = st.selectbox(
+            "Sumber report",
+            options=list(ver_labels.keys()),
+            format_func=lambda v: ver_labels.get(v, v),
+            key="ai_version",
+        )
+    tickers_avail = ai_asst.list_tickers_in_report(ai_version)
+    with ai_col2:
+        if not tickers_avail:
+            st.selectbox(
+                "Ticker",
+                options=["(tidak ada data — jalankan screener dulu)"],
+                disabled=True,
+                key="ai_ticker_dummy",
+            )
+            selected_tickers = []
+        else:
+            selected_tickers = st.multiselect(
+                "Ticker (maks. 3 per analisa)",
+                options=tickers_avail,
+                default=tickers_avail[:1],
+                max_selections=3,
+                key="ai_tickers",
+            )
+
+    ai_model = st.text_input(
+        "Model (opsional, kosongkan = default env)",
+        value="",
+        key="ai_model",
+        help="Contoh: gpt-4o-mini, grok-2-latest",
+    )
+
+    run_ai_btn = st.button(
+        "🧠 Analisa dengan AI",
+        type="primary",
+        width="stretch",
+        disabled=not selected_tickers,
+        key="ai_run_btn",
+    )
+
+    if run_ai_btn and selected_tickers:
+        regime_ctx = st.session_state.get("ihsg_regime") or {}
+        # buang field terlalu panjang jika ada
+        regime_slim = {
+            k: regime_ctx.get(k)
+            for k in (
+                "regime",
+                "activity",
+                "strategies",
+                "last_close",
+                "reason",
+                "activity_reason",
+                "vol_ratio_20",
+                "range_5_pct",
+                "range_20_pct",
+            )
+            if k in regime_ctx
+        }
+        results_ai = []
+        with st.spinner(f"Menjalankan agent untuk {', '.join(selected_tickers)}..."):
+            for t in selected_tickers:
+                try:
+                    out = ai_asst.analyze_ticker(
+                        t,
+                        ai_version,
+                        regime=regime_slim,
+                        account_size=float(account_size),
+                        risk_pct=float(risk_pct),
+                        broker_buy_pct=float(broker_buy),
+                        broker_sell_pct=float(broker_sell),
+                        model=ai_model.strip() or None,
+                    )
+                    results_ai.append(out)
+                except Exception as e:
+                    results_ai.append(
+                        {
+                            "ticker": t,
+                            "version": ai_version,
+                            "error": str(e),
+                            "analyses": {},
+                        }
+                    )
+        st.session_state["ai_assistant_results"] = results_ai
+
+    for out in st.session_state.get("ai_assistant_results") or []:
+        t = out.get("ticker", "?")
+        st.markdown(f"### {t} · `{out.get('version', '')}`")
+        if out.get("error") and not (out.get("analyses") or {}):
+            st.error(out["error"])
+            continue
+        if out.get("offline"):
+            st.caption("Hasil mode offline / heuristik")
+        if out.get("partial"):
+            st.warning(
+                "Sebagian role gagal (sering timeout/koneksi klien meski OpenAI "
+                "sudah memproses). Role yang sukses tetap ditampilkan di bawah."
+            )
+            err_map = out.get("errors") or {}
+            if err_map:
+                with st.expander("Detail error per role", expanded=False):
+                    for rk, rv in err_map.items():
+                        st.text(f"{rk}: {rv}")
+        analyses = out.get("analyses") or {}
+        if analyses.get("chief"):
+            st.markdown("**Chief (ringkasan)**")
+            st.markdown(analyses["chief"])
+        for role in ("technical", "fundamental", "risk", "critic"):
+            if analyses.get(role):
+                with st.expander(f"{role.capitalize()}", expanded=(role == "technical")):
+                    st.markdown(analyses[role])
+        ctx = out.get("context") or {}
+        news = ctx.get("news_intel") or {}
+        if news.get("headlines") or news.get("verify_search_url"):
+            with st.expander(
+                f"Berita / web intel ({news.get('headline_count', 0)}) · tone={news.get('tone_hint', '?')}",
+                expanded=False,
+            ):
+                vurl = news.get("verify_search_url")
+                if vurl:
+                    st.markdown(f"[Cari semua berita terkait di Google News]({vurl})")
+                for h in news.get("headlines") or []:
+                    title = h.get("title") or "-"
+                    pub = h.get("publisher") or h.get("source") or ""
+                    date = h.get("date") or ""
+                    url = h.get("url") or ""
+                    kind = h.get("link_kind") or ""
+                    meta = " · ".join(x for x in [pub, date, kind] if x)
+                    if url:
+                        st.markdown(f"- [{title}]({url})" + (f" — _{meta}_" if meta else ""))
+                    else:
+                        st.markdown(f"- **{title}**" + (f" — _{meta}_" if meta else ""))
+                if news.get("disclaimer"):
+                    st.caption(news["disclaimer"])
+        with st.expander("Konteks JSON (debug)", expanded=False):
+            st.json(ctx)
+        st.markdown("---")
+
 st.caption("IDX Master Screener AI • Bukan rekomendasi investasi")
