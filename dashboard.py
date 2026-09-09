@@ -383,427 +383,423 @@ def show_report(version: str, title: str):
 
 
 # =====================================================================
-# PANEL REZIM IHSG (on-demand)
+# MAIN TABS: Kondisi Pasar | Screener | AI Assistant
 # =====================================================================
-st.subheader("📡 Kondisi Pasar IHSG")
+tab_pasar, tab_screener, tab_ai = st.tabs(
+    ["📡 Kondisi Pasar", "📊 Screener", "🤖 AI Assistant"]
+)
 
-cek_rezim = st.button("🔍 Cek Rezim Sekarang", width="stretch")
+# ---------- TAB 1: KONDISI PASAR ----------
+with tab_pasar:
+    st.subheader("📡 Kondisi Pasar IHSG")
 
-if cek_rezim:
-    with st.spinner("Mengambil data IHSG..."):
-        try:
-            import master_screener_ai
+    cek_rezim = st.button("🔍 Cek Rezim Sekarang", width="stretch", key="btn_cek_rezim")
 
-            st.session_state["ihsg_regime"] = master_screener_ai.analyze_ihsg_regime()
-        except Exception as e:
-            st.session_state["ihsg_regime"] = {
-                "regime": "UNKNOWN",
-                "reason": [str(e)],
-                "strategies": [],
-                "last_close": None,
-            }
-
-if "ihsg_regime" not in st.session_state:
-    st.session_state["ihsg_regime"] = {
-        "regime": "Belum dicek",
-        "reason": ["Klik tombol **Cek Rezim Sekarang** untuk menganalisa IHSG."],
-        "strategies": [],
-        "last_close": None,
-    }
-
-reg = st.session_state.get("ihsg_regime", {})
-regime = reg.get("regime", "UNKNOWN")
-
-if "BULLISH" in str(regime):
-    st.success(f"**Rezim: {regime}**")
-elif "BEARISH" in str(regime):
-    st.error(f"**Rezim: {regime}**")
-elif "SIDEWAYS" in str(regime):
-    st.warning(f"**Rezim: {regime}**")
-else:
-    st.info(f"**Rezim: {regime}**")
-
-activity = reg.get("activity", "Belum dicek")
-if activity == "RAMAI":
-    st.success(f"**Aktivitas pasar: {activity} (bergairah)**")
-elif activity == "SEPI":
-    st.warning(f"**Aktivitas pasar: {activity} (lesu)**")
-elif activity == "NORMAL":
-    st.info(f"**Aktivitas pasar: {activity}**")
-
-for r in reg.get("activity_reason") or []:
-    st.caption(r)
-
-if reg.get("vol_ratio_20") is not None:
-    st.caption(
-        f"Vol IHSG: {reg['vol_ratio_20']}x avg20 · "
-        f"Range5: {reg.get('range_5_pct', '-')}% · "
-        f"Range20: {reg.get('range_20_pct', '-')}%"
-    )
-elif reg.get("activity_reason"):
-    st.caption("Vol IHSG: n/a (data volume indeks sering tidak valid di Yahoo)")
-
-mc = st.columns(4)
-if reg.get("last_close"):
-    mc[0].metric("IHSG", f"{reg['last_close']:,.2f}")
-if reg.get("ma20"):
-    mc[1].metric("MA20", f"{reg['ma20']:,.0f}")
-if reg.get("ma50"):
-    mc[2].metric("MA50", f"{reg['ma50']:,.0f}")
-if reg.get("ma100"):
-    mc[3].metric("MA100", f"{reg['ma100']:,.0f}")
-
-for r in reg.get("reason") or []:
-    st.markdown(f"- {r}")
-if reg.get("strategies"):
-    st.markdown(f"**Strategi disarankan:** `{', '.join(reg['strategies'])}`")
-
-st.markdown("---")
-
-# =====================================================================
-# JALANKAN SCREENER
-# =====================================================================
-if run_button:
-    params = {
-        "account_size": float(account_size),
-        "risk_per_trade_pct": float(risk_pct),
-        "broker_buy_pct": float(broker_buy),
-        "broker_sell_pct": float(broker_sell),
-    }
-    label = mode
-    started_at = datetime.now()
-
-    spinner_msg = f"Menjalankan {label}..."
-    if mode.startswith("🎯") and not skip_cf:
-        spinner_msg += " (semua strategi — bisa 5–15 menit)"
-    else:
-        spinner_msg += " (1–3 menit)"
-
-    with st.spinner(spinner_msg):
-        if mode.startswith("🤖"):
-            ok, err, log = capture_run(
-                run_ai, account_size, risk_pct, broker_buy, broker_sell
-            )
+    if cek_rezim:
+        with st.spinner("Mengambil data IHSG..."):
             try:
                 import master_screener_ai
 
-                st.session_state["ihsg_regime"] = (
-                    master_screener_ai.analyze_ihsg_regime()
-                )
-            except Exception:
-                pass
-        elif mode.startswith("V2"):
-            ok, err, log = capture_run(run_v2, params)
-        elif mode.startswith("V3"):
-            ok, err, log = capture_run(run_v3, params)
-        elif mode.startswith("V4"):
-            ok, err, log = capture_run(run_v4, params)
-        elif mode.startswith("V5"):
-            ok, err, log = capture_run(run_v5, params)
-        elif mode.startswith("⚡"):
-            ok, err, log = capture_run(run_intraday, params)
-        elif mode.startswith("🔥") or "HighBeta" in mode:
-            ok, err, log = capture_run(run_highbeta, params)
-        elif mode.startswith("📦") or "Accumulation" in mode:
-            ok, err, log = capture_run(run_accumulation, params)
-        elif mode.startswith("🎯") or "Confluence" in mode:
-            ok, err, log = capture_run(run_confluence, params, skip_cf)
-        else:
-            ok, err, log = False, "Mode tidak dikenal", ""
+                st.session_state["ihsg_regime"] = master_screener_ai.analyze_ihsg_regime()
+            except Exception as e:
+                st.session_state["ihsg_regime"] = {
+                    "regime": "UNKNOWN",
+                    "reason": [str(e)],
+                    "strategies": [],
+                    "last_close": None,
+                }
 
-        # Enrich setelah run non-AI (termasuk setelah confluence menjalankan sub-screener)
-        if ok and not mode.startswith("🤖"):
-            enrich_all_version_csvs(broker_buy, broker_sell)
-
-    finished_at = datetime.now()
-    duration_sec = (finished_at - started_at).total_seconds()
-
-    counts = {ver: count_report_rows(ver) for ver in REPORT_VERSIONS}
-
-    st.session_state["last_run_status"] = {
-        "ok": ok,
-        "mode": label,
-        "error": err,
-        "log": log or "",
-        "started_at": started_at.strftime("%Y-%m-%d %H:%M:%S"),
-        "finished_at": finished_at.strftime("%Y-%m-%d %H:%M:%S"),
-        "duration_sec": round(duration_sec, 1),
-        "counts": counts,
-        "account_size": float(account_size),
-        "risk_pct": float(risk_pct),
-        "broker_buy": float(broker_buy),
-        "broker_sell": float(broker_sell),
-    }
-
-    if ok:
-        st.success(f"✅ {label} selesai.")
-    else:
-        st.error(f"❌ {err}")
-
-    with st.expander("📋 Log", expanded=not ok):
-        st.text(log if log and log.strip() else "(kosong)")
-
-# =====================================================================
-# STATUS RUN TERAKHIR
-# =====================================================================
-st.subheader("📌 Status Run Terakhir")
-status = st.session_state.get("last_run_status")
-
-if not status:
-    st.info("Belum ada screener yang dijalankan di sesi ini.")
-else:
-    if status.get("ok"):
-        st.success("Status: **Berhasil**")
-    else:
-        st.error(f"Status: **Gagal** — {status.get('error') or '-'}")
-
-    st.caption(
-        f"**Mode:** {status.get('mode', '-')} · "
-        f"**Durasi:** {status.get('duration_sec', 0)} dtk · "
-        f"**Mulai:** {status.get('started_at', '-')} · "
-        f"**Selesai:** {status.get('finished_at', '-')}"
-    )
-    st.caption(
-        f"Modal: Rp {status.get('account_size', 0):,.0f} · "
-        f"Risiko: {status.get('risk_pct', 0)}% · "
-        f"Fee beli/jual: {status.get('broker_buy', 0)}% / {status.get('broker_sell', 0)}%"
-    )
-
-    counts = status.get("counts") or {}
-    if counts:
-        st.caption(
-            f"Setup — V2:**{counts.get('v2', 0)}** · "
-            f"V3:**{counts.get('v3', 0)}** · "
-            f"V4:**{counts.get('v4', 0)}** · "
-            f"V5:**{counts.get('v5', 0)}** · "
-            f"Intra:**{counts.get('intraday', 0)}** · "
-            f"HB:**{counts.get('highbeta', 0)}** · "
-            f"Acc:**{counts.get('accumulation', 0)}** · "
-            f"CF:**{counts.get('confluence', 0)}**"
-        )
-
-    with st.expander("📋 Log run terakhir", expanded=False):
-        st.text(status.get("log") or "(kosong)")
-
-st.markdown("---")
-
-# =====================================================================
-# HASIL PER STRATEGI
-# =====================================================================
-st.subheader("📊 Hasil Screener per Strategi")
-
-tabs = st.tabs(
-    [
-        "V2 Breakout",
-        "V3 Retest Fibo",
-        "V4 Order Block",
-        "V5 CHOCH",
-        "⚡ Intraday",
-        "🔥 HighBeta",
-        "📦 Accumulation",
-        "🎯 Confluence",
-    ]
-)
-
-with tabs[0]:
-    show_report("v2", "V2 Breakout")
-with tabs[1]:
-    show_report("v3", "V3 Retest Fibo")
-with tabs[2]:
-    show_report("v4", "V4 Order Block")
-with tabs[3]:
-    show_report("v5", "V5 CHOCH")
-with tabs[4]:
-    show_report("intraday", "Intraday Confluence")
-with tabs[5]:
-    show_report("highbeta", "HighBeta Liquid")
-with tabs[6]:
-    show_report("accumulation", "Accumulation Late/Early")
-with tabs[7]:
-    show_report("confluence", "Confluence Top Overlap")
-
-st.markdown("---")
-
-# =====================================================================
-# AI TRADER ASSISTANT
-# =====================================================================
-st.subheader("🤖 AI Trader Assistant")
-st.caption(
-    "Pilih ticker dari hasil screener → multi-agent (technical / risk / critic / chief). "
-    "Bukan rekomendasi investasi."
-)
-
-try:
-    import idx_ai_assistant as ai_asst
-
-    AI_OK = True
-except ImportError:
-    AI_OK = False
-    ai_asst = None
-
-if not AI_OK:
-    st.warning(
-        "Modul `idx_ai_assistant.py` tidak ditemukan di folder project. "
-        "Tambahkan file tersebut lalu restart Streamlit."
-    )
-else:
-    offline = not ai_asst.llm_available()
-    if offline:
-        st.info(
-            "Mode **offline** (heuristik). Set secret/env "
-            "`OPENAI_API_KEY` atau `XAI_API_KEY` "
-            "(opsional `OPENAI_BASE_URL`, `OPENAI_MODEL`) untuk analisa LLM penuh."
-        )
-    else:
-        st.success("LLM API terdeteksi — agent akan memanggil model.")
-
-    ver_labels = {
-        "v2": "V2 Breakout",
-        "v3": "V3 Retest",
-        "v4": "V4 Order Block",
-        "v5": "V5 CHOCH",
-        "intraday": "Intraday",
-        "highbeta": "HighBeta",
-        "accumulation": "Accumulation",
-        "confluence": "Confluence",
-    }
-    ai_col1, ai_col2 = st.columns([1, 2])
-    with ai_col1:
-        ai_version = st.selectbox(
-            "Sumber report",
-            options=list(ver_labels.keys()),
-            format_func=lambda v: ver_labels.get(v, v),
-            key="ai_version",
-        )
-    tickers_avail = ai_asst.list_tickers_in_report(ai_version)
-    with ai_col2:
-        if not tickers_avail:
-            st.selectbox(
-                "Ticker",
-                options=["(tidak ada data — jalankan screener dulu)"],
-                disabled=True,
-                key="ai_ticker_dummy",
-            )
-            selected_tickers = []
-        else:
-            selected_tickers = st.multiselect(
-                "Ticker (maks. 3 per analisa)",
-                options=tickers_avail,
-                default=tickers_avail[:1],
-                max_selections=3,
-                key="ai_tickers",
-            )
-
-    ai_model = st.text_input(
-        "Model (opsional, kosongkan = default env)",
-        value="",
-        key="ai_model",
-        help="Contoh: gpt-4o-mini, grok-2-latest",
-    )
-
-    run_ai_btn = st.button(
-        "🧠 Analisa dengan AI",
-        type="primary",
-        width="stretch",
-        disabled=not selected_tickers,
-        key="ai_run_btn",
-    )
-
-    if run_ai_btn and selected_tickers:
-        regime_ctx = st.session_state.get("ihsg_regime") or {}
-        # buang field terlalu panjang jika ada
-        regime_slim = {
-            k: regime_ctx.get(k)
-            for k in (
-                "regime",
-                "activity",
-                "strategies",
-                "last_close",
-                "reason",
-                "activity_reason",
-                "vol_ratio_20",
-                "range_5_pct",
-                "range_20_pct",
-            )
-            if k in regime_ctx
+    if "ihsg_regime" not in st.session_state:
+        st.session_state["ihsg_regime"] = {
+            "regime": "Belum dicek",
+            "reason": ["Klik tombol **Cek Rezim Sekarang** untuk menganalisa IHSG."],
+            "strategies": [],
+            "last_close": None,
         }
-        results_ai = []
-        with st.spinner(f"Menjalankan agent untuk {', '.join(selected_tickers)}..."):
-            for t in selected_tickers:
-                try:
-                    out = ai_asst.analyze_ticker(
-                        t,
-                        ai_version,
-                        regime=regime_slim,
-                        account_size=float(account_size),
-                        risk_pct=float(risk_pct),
-                        broker_buy_pct=float(broker_buy),
-                        broker_sell_pct=float(broker_sell),
-                        model=ai_model.strip() or None,
-                    )
-                    results_ai.append(out)
-                except Exception as e:
-                    results_ai.append(
-                        {
-                            "ticker": t,
-                            "version": ai_version,
-                            "error": str(e),
-                            "analyses": {},
-                        }
-                    )
-        st.session_state["ai_assistant_results"] = results_ai
 
-    for out in st.session_state.get("ai_assistant_results") or []:
-        t = out.get("ticker", "?")
-        st.markdown(f"### {t} · `{out.get('version', '')}`")
-        if out.get("error") and not (out.get("analyses") or {}):
-            st.error(out["error"])
-            continue
-        if out.get("offline"):
-            st.caption("Hasil mode offline / heuristik")
-        if out.get("partial"):
-            st.warning(
-                "Sebagian role gagal (sering timeout/koneksi klien meski OpenAI "
-                "sudah memproses). Role yang sukses tetap ditampilkan di bawah."
+    reg = st.session_state.get("ihsg_regime", {})
+    regime = reg.get("regime", "UNKNOWN")
+
+    if "BULLISH" in str(regime):
+        st.success(f"**Rezim: {regime}**")
+    elif "BEARISH" in str(regime):
+        st.error(f"**Rezim: {regime}**")
+    elif "SIDEWAYS" in str(regime):
+        st.warning(f"**Rezim: {regime}**")
+    else:
+        st.info(f"**Rezim: {regime}**")
+
+    activity = reg.get("activity", "Belum dicek")
+    if activity == "RAMAI":
+        st.success(f"**Aktivitas pasar: {activity} (bergairah)**")
+    elif activity == "SEPI":
+        st.warning(f"**Aktivitas pasar: {activity} (lesu)**")
+    elif activity == "NORMAL":
+        st.info(f"**Aktivitas pasar: {activity}**")
+
+    for r in reg.get("activity_reason") or []:
+        st.caption(r)
+
+    if reg.get("vol_ratio_20") is not None:
+        st.caption(
+            f"Vol IHSG: {reg['vol_ratio_20']}x avg20 · "
+            f"Range5: {reg.get('range_5_pct', '-')}% · "
+            f"Range20: {reg.get('range_20_pct', '-')}%"
+        )
+    elif reg.get("activity_reason"):
+        st.caption("Vol IHSG: n/a (data volume indeks sering tidak valid di Yahoo)")
+
+    mc = st.columns(4)
+    if reg.get("last_close"):
+        mc[0].metric("IHSG", f"{reg['last_close']:,.2f}")
+    if reg.get("ma20"):
+        mc[1].metric("MA20", f"{reg['ma20']:,.0f}")
+    if reg.get("ma50"):
+        mc[2].metric("MA50", f"{reg['ma50']:,.0f}")
+    if reg.get("ma100"):
+        mc[3].metric("MA100", f"{reg['ma100']:,.0f}")
+
+    for r in reg.get("reason") or []:
+        st.markdown(f"- {r}")
+    if reg.get("strategies"):
+        st.markdown(f"**Strategi disarankan:** `{', '.join(reg['strategies'])}`")
+
+# ---------- TAB 2: SCREENER ----------
+with tab_screener:
+    st.subheader("📊 Screener")
+    st.caption("Pilih mode di sidebar, lalu klik **JALANKAN**. Hasil tampil per strategi di bawah.")
+
+    # Jalankan screener (tombol di sidebar)
+    if run_button:
+        params = {
+            "account_size": float(account_size),
+            "risk_per_trade_pct": float(risk_pct),
+            "broker_buy_pct": float(broker_buy),
+            "broker_sell_pct": float(broker_sell),
+        }
+        label = mode
+        started_at = datetime.now()
+
+        spinner_msg = f"Menjalankan {label}..."
+        if mode.startswith("🎯") and not skip_cf:
+            spinner_msg += " (semua strategi — bisa 5–15 menit)"
+        else:
+            spinner_msg += " (1–3 menit)"
+
+        with st.spinner(spinner_msg):
+            if mode.startswith("🤖"):
+                ok, err, log = capture_run(
+                    run_ai, account_size, risk_pct, broker_buy, broker_sell
+                )
+                try:
+                    import master_screener_ai
+
+                    st.session_state["ihsg_regime"] = (
+                        master_screener_ai.analyze_ihsg_regime()
+                    )
+                except Exception:
+                    pass
+            elif mode.startswith("V2"):
+                ok, err, log = capture_run(run_v2, params)
+            elif mode.startswith("V3"):
+                ok, err, log = capture_run(run_v3, params)
+            elif mode.startswith("V4"):
+                ok, err, log = capture_run(run_v4, params)
+            elif mode.startswith("V5"):
+                ok, err, log = capture_run(run_v5, params)
+            elif mode.startswith("⚡"):
+                ok, err, log = capture_run(run_intraday, params)
+            elif mode.startswith("🔥") or "HighBeta" in mode:
+                ok, err, log = capture_run(run_highbeta, params)
+            elif mode.startswith("📦") or "Accumulation" in mode:
+                ok, err, log = capture_run(run_accumulation, params)
+            elif mode.startswith("🎯") or "Confluence" in mode:
+                ok, err, log = capture_run(run_confluence, params, skip_cf)
+            else:
+                ok, err, log = False, "Mode tidak dikenal", ""
+
+            if ok and not mode.startswith("🤖"):
+                enrich_all_version_csvs(broker_buy, broker_sell)
+
+        finished_at = datetime.now()
+        duration_sec = (finished_at - started_at).total_seconds()
+        counts = {ver: count_report_rows(ver) for ver in REPORT_VERSIONS}
+
+        st.session_state["last_run_status"] = {
+            "ok": ok,
+            "mode": label,
+            "error": err,
+            "log": log or "",
+            "started_at": started_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "finished_at": finished_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "duration_sec": round(duration_sec, 1),
+            "counts": counts,
+            "account_size": float(account_size),
+            "risk_pct": float(risk_pct),
+            "broker_buy": float(broker_buy),
+            "broker_sell": float(broker_sell),
+        }
+
+        if ok:
+            st.success(f"✅ {label} selesai.")
+        else:
+            st.error(f"❌ {err}")
+
+        with st.expander("📋 Log", expanded=not ok):
+            st.text(log if log and log.strip() else "(kosong)")
+
+    # Status run terakhir
+    st.markdown("##### 📌 Status Run Terakhir")
+    status = st.session_state.get("last_run_status")
+
+    if not status:
+        st.info("Belum ada screener yang dijalankan di sesi ini.")
+    else:
+        if status.get("ok"):
+            st.success("Status: **Berhasil**")
+        else:
+            st.error(f"Status: **Gagal** — {status.get('error') or '-'}")
+
+        st.caption(
+            f"**Mode:** {status.get('mode', '-')} · "
+            f"**Durasi:** {status.get('duration_sec', 0)} dtk · "
+            f"**Mulai:** {status.get('started_at', '-')} · "
+            f"**Selesai:** {status.get('finished_at', '-')}"
+        )
+        st.caption(
+            f"Modal: Rp {status.get('account_size', 0):,.0f} · "
+            f"Risiko: {status.get('risk_pct', 0)}% · "
+            f"Fee beli/jual: {status.get('broker_buy', 0)}% / {status.get('broker_sell', 0)}%"
+        )
+
+        counts = status.get("counts") or {}
+        if counts:
+            st.caption(
+                f"Setup — V2:**{counts.get('v2', 0)}** · "
+                f"V3:**{counts.get('v3', 0)}** · "
+                f"V4:**{counts.get('v4', 0)}** · "
+                f"V5:**{counts.get('v5', 0)}** · "
+                f"Intra:**{counts.get('intraday', 0)}** · "
+                f"HB:**{counts.get('highbeta', 0)}** · "
+                f"Acc:**{counts.get('accumulation', 0)}** · "
+                f"CF:**{counts.get('confluence', 0)}**"
             )
-            err_map = out.get("errors") or {}
-            if err_map:
-                with st.expander("Detail error per role", expanded=False):
-                    for rk, rv in err_map.items():
-                        st.text(f"{rk}: {rv}")
-        analyses = out.get("analyses") or {}
-        if analyses.get("chief"):
-            st.markdown("**Chief (ringkasan)**")
-            st.markdown(analyses["chief"])
-        for role in ("technical", "fundamental", "risk", "critic"):
-            if analyses.get(role):
-                with st.expander(f"{role.capitalize()}", expanded=(role == "technical")):
-                    st.markdown(analyses[role])
-        ctx = out.get("context") or {}
-        news = ctx.get("news_intel") or {}
-        if news.get("headlines") or news.get("verify_search_url"):
-            with st.expander(
-                f"Berita / web intel ({news.get('headline_count', 0)}) · tone={news.get('tone_hint', '?')}",
-                expanded=False,
-            ):
-                vurl = news.get("verify_search_url")
-                if vurl:
-                    st.markdown(f"[Cari semua berita terkait di Google News]({vurl})")
-                for h in news.get("headlines") or []:
-                    title = h.get("title") or "-"
-                    pub = h.get("publisher") or h.get("source") or ""
-                    date = h.get("date") or ""
-                    url = h.get("url") or ""
-                    kind = h.get("link_kind") or ""
-                    meta = " · ".join(x for x in [pub, date, kind] if x)
-                    if url:
-                        st.markdown(f"- [{title}]({url})" + (f" — _{meta}_" if meta else ""))
-                    else:
-                        st.markdown(f"- **{title}**" + (f" — _{meta}_" if meta else ""))
-                if news.get("disclaimer"):
-                    st.caption(news["disclaimer"])
-        with st.expander("Konteks JSON (debug)", expanded=False):
-            st.json(ctx)
-        st.markdown("---")
+
+        with st.expander("📋 Log run terakhir", expanded=False):
+            st.text(status.get("log") or "(kosong)")
+
+    st.markdown("---")
+    st.markdown("##### Hasil per strategi")
+
+    sub_tabs = st.tabs(
+        [
+            "V2 Breakout",
+            "V3 Retest Fibo",
+            "V4 Order Block",
+            "V5 CHOCH",
+            "⚡ Intraday",
+            "🔥 HighBeta",
+            "📦 Accumulation",
+            "🎯 Confluence",
+        ]
+    )
+
+    with sub_tabs[0]:
+        show_report("v2", "V2 Breakout")
+    with sub_tabs[1]:
+        show_report("v3", "V3 Retest Fibo")
+    with sub_tabs[2]:
+        show_report("v4", "V4 Order Block")
+    with sub_tabs[3]:
+        show_report("v5", "V5 CHOCH")
+    with sub_tabs[4]:
+        show_report("intraday", "Intraday Confluence")
+    with sub_tabs[5]:
+        show_report("highbeta", "HighBeta Liquid")
+    with sub_tabs[6]:
+        show_report("accumulation", "Accumulation Late/Early")
+    with sub_tabs[7]:
+        show_report("confluence", "Confluence Top Overlap")
+
+# ---------- TAB 3: AI ASSISTANT ----------
+with tab_ai:
+    st.subheader("🤖 AI Trader Assistant")
+    st.caption(
+        "Pilih ticker dari hasil screener → multi-agent "
+        "(technical / fundamental / risk / critic / chief). "
+        "Bukan rekomendasi investasi."
+    )
+
+    try:
+        import idx_ai_assistant as ai_asst
+
+        AI_OK = True
+    except ImportError:
+        AI_OK = False
+        ai_asst = None
+
+    if not AI_OK:
+        st.warning(
+            "Modul `idx_ai_assistant.py` tidak ditemukan di folder project. "
+            "Tambahkan file tersebut lalu restart Streamlit."
+        )
+    else:
+        offline = not ai_asst.llm_available()
+        if offline:
+            st.info(
+                "Mode **offline** (heuristik). Set secret/env "
+                "`OPENAI_API_KEY` atau `XAI_API_KEY` "
+                "(opsional `OPENAI_BASE_URL`, `OPENAI_MODEL`) untuk analisa LLM penuh."
+            )
+        else:
+            st.success("LLM API terdeteksi — agent akan memanggil model.")
+
+        ver_labels = {
+            "v2": "V2 Breakout",
+            "v3": "V3 Retest",
+            "v4": "V4 Order Block",
+            "v5": "V5 CHOCH",
+            "intraday": "Intraday",
+            "highbeta": "HighBeta",
+            "accumulation": "Accumulation",
+            "confluence": "Confluence",
+        }
+        ai_col1, ai_col2 = st.columns([1, 2])
+        with ai_col1:
+            ai_version = st.selectbox(
+                "Sumber report",
+                options=list(ver_labels.keys()),
+                format_func=lambda v: ver_labels.get(v, v),
+                key="ai_version",
+            )
+        tickers_avail = ai_asst.list_tickers_in_report(ai_version)
+        with ai_col2:
+            if not tickers_avail:
+                st.selectbox(
+                    "Ticker",
+                    options=["(tidak ada data — jalankan screener dulu)"],
+                    disabled=True,
+                    key="ai_ticker_dummy",
+                )
+                selected_tickers = []
+            else:
+                selected_tickers = st.multiselect(
+                    "Ticker (maks. 3 per analisa)",
+                    options=tickers_avail,
+                    default=tickers_avail[:1],
+                    max_selections=3,
+                    key="ai_tickers",
+                )
+
+        ai_model = st.text_input(
+            "Model (opsional, kosongkan = default env)",
+            value="",
+            key="ai_model",
+            help="Contoh: gpt-4o-mini, grok-2-latest",
+        )
+
+        run_ai_btn = st.button(
+            "🧠 Analisa dengan AI",
+            type="primary",
+            width="stretch",
+            disabled=not selected_tickers,
+            key="ai_run_btn",
+        )
+
+        if run_ai_btn and selected_tickers:
+            regime_ctx = st.session_state.get("ihsg_regime") or {}
+            regime_slim = {
+                k: regime_ctx.get(k)
+                for k in (
+                    "regime",
+                    "activity",
+                    "strategies",
+                    "last_close",
+                    "reason",
+                    "activity_reason",
+                    "vol_ratio_20",
+                    "range_5_pct",
+                    "range_20_pct",
+                )
+                if k in regime_ctx
+            }
+            results_ai = []
+            with st.spinner(f"Menjalankan agent untuk {', '.join(selected_tickers)}..."):
+                for t in selected_tickers:
+                    try:
+                        out = ai_asst.analyze_ticker(
+                            t,
+                            ai_version,
+                            regime=regime_slim,
+                            account_size=float(account_size),
+                            risk_pct=float(risk_pct),
+                            broker_buy_pct=float(broker_buy),
+                            broker_sell_pct=float(broker_sell),
+                            model=ai_model.strip() or None,
+                        )
+                        results_ai.append(out)
+                    except Exception as e:
+                        results_ai.append(
+                            {
+                                "ticker": t,
+                                "version": ai_version,
+                                "error": str(e),
+                                "analyses": {},
+                            }
+                        )
+            st.session_state["ai_assistant_results"] = results_ai
+
+        for out in st.session_state.get("ai_assistant_results") or []:
+            t = out.get("ticker", "?")
+            st.markdown(f"### {t} · `{out.get('version', '')}`")
+            if out.get("error") and not (out.get("analyses") or {}):
+                st.error(out["error"])
+                continue
+            if out.get("offline"):
+                st.caption("Hasil mode offline / heuristik")
+            if out.get("partial"):
+                st.warning(
+                    "Sebagian role gagal (sering timeout/koneksi klien meski OpenAI "
+                    "sudah memproses). Role yang sukses tetap ditampilkan di bawah."
+                )
+                err_map = out.get("errors") or {}
+                if err_map:
+                    with st.expander("Detail error per role", expanded=False):
+                        for rk, rv in err_map.items():
+                            st.text(f"{rk}: {rv}")
+            analyses = out.get("analyses") or {}
+            if analyses.get("chief"):
+                st.markdown("**Chief (ringkasan)**")
+                st.markdown(analyses["chief"])
+            for role in ("technical", "fundamental", "risk", "critic"):
+                if analyses.get(role):
+                    with st.expander(f"{role.capitalize()}", expanded=(role == "technical")):
+                        st.markdown(analyses[role])
+            ctx = out.get("context") or {}
+            news = ctx.get("news_intel") or {}
+            if news.get("headlines") or news.get("verify_search_url"):
+                with st.expander(
+                    f"Berita / web intel ({news.get('headline_count', 0)}) · tone={news.get('tone_hint', '?')}",
+                    expanded=False,
+                ):
+                    vurl = news.get("verify_search_url")
+                    if vurl:
+                        st.markdown(f"[Cari semua berita terkait di Google News]({vurl})")
+                    for h in news.get("headlines") or []:
+                        title = h.get("title") or "-"
+                        pub = h.get("publisher") or h.get("source") or ""
+                        date = h.get("date") or ""
+                        url = h.get("url") or ""
+                        kind = h.get("link_kind") or ""
+                        meta = " · ".join(x for x in [pub, date, kind] if x)
+                        if url:
+                            st.markdown(f"- [{title}]({url})" + (f" — _{meta}_" if meta else ""))
+                        else:
+                            st.markdown(f"- **{title}**" + (f" — _{meta}_" if meta else ""))
+                    if news.get("disclaimer"):
+                        st.caption(news["disclaimer"])
+            with st.expander("Konteks JSON (debug)", expanded=False):
+                st.json(ctx)
+            st.markdown("---")
 
 st.caption("IDX Master Screener AI • Bukan rekomendasi investasi")
