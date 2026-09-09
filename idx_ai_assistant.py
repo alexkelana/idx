@@ -441,27 +441,103 @@ def _extract_yf_link(n: dict) -> str | None:
 
 
 
-def fetch_news_intel(ticker: str, max_items: int = 6) -> dict[str, Any]:
-    """
-    Kumpulkan headline/news terkait ticker untuk pertimbangan agent.
-    Setiap item diusahakan punya URL absolut yang bisa diklik/diverifikasi.
-    Sumber: yfinance news + Google News RSS (ID).
-    """
-    import xml.etree.ElementTree as ET
+
+def _parse_rss_datetime(pub_date: str):
+    """Return timezone-aware or naive datetime for sorting; None if fail."""
     from email.utils import parsedate_to_datetime
+    if not pub_date:
+        return None
+    try:
+        return parsedate_to_datetime(pub_date)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(str(pub_date)[:19], fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _fetch_google_news_rss(query: str, max_items: int = 10, label: str = "google_news") -> list[dict]:
+    """Ambil item dari Google News RSS (real-time relatif, locale ID)."""
+    import xml.etree.ElementTree as ET
     import urllib.request
     import urllib.parse
 
-    ticker = str(ticker).upper().strip()
     items: list[dict] = []
+    q = urllib.parse.quote(query)
+    rss_url = f"https://news.google.com/rss/search?q={q}&hl=id&gl=ID&ceid=ID:id"
+    req = urllib.request.Request(
+        rss_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; IDXAssistant/1.1; +local)"
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=14) as r:
+        xml_bytes = r.read()
+    root = ET.fromstring(xml_bytes)
+    channel = root.find("channel")
+    rss_items = channel.findall("item") if channel is not None else root.findall(".//item")
+    for it in rss_items:
+        if len(items) >= max_items:
+            break
+        title = (it.findtext("title") or "").strip()
+        link = (it.findtext("link") or "").strip()
+        if not link:
+            guid = it.find("guid")
+            if guid is not None and (guid.text or "").startswith("http"):
+                link = guid.text.strip()
+        pub_date = (it.findtext("pubDate") or "").strip()
+        source_el = it.find("source")
+        publisher = (source_el.text or "").strip() if source_el is not None else None
+        dt = _parse_rss_datetime(pub_date)
+        date_s = dt.strftime("%Y-%m-%d %H:%M") if dt else (pub_date[:16] if pub_date else None)
+        url = _normalize_news_url(link)
+        items.append(
+            {
+                "title": title[:240],
+                "publisher": (publisher[:80] if publisher else None),
+                "url": url,
+                "date": date_s,
+                "date_ts": dt.timestamp() if dt else 0.0,
+                "source": label,
+            }
+        )
+    return items
+
+
+def fetch_news_intel(
+    ticker: str,
+    max_items: int = 8,
+    *,
+    hours_lookback: int = 72,
+) -> dict[str, Any]:
+    """
+    Berita real-time / near real-time terkait ticker.
+
+    Sumber (digabung, diurutkan terbaru):
+      1) yfinance Ticker.news
+      2) Google News RSS — query ticker (when:7d)
+      3) Google News RSS — site berita ID (CNBC/Kontan/Bisnis) + ticker
+
+    Setiap item diusahakan punya URL klikabel.
+    """
+    import urllib.parse
+
+    ticker = str(ticker).upper().strip()
+    raw: list[dict] = []
     sources_ok: list[str] = []
     errors: list[str] = []
+    now = datetime.now()
+    fetched_at = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    def _push(title, publisher, link, date, source):
+    def _push(title, publisher, link, date_s, date_ts, source):
         title = (title or "").strip()
         if not title:
             return
-        if any((title[:80].lower() == (x.get("title") or "")[:80].lower()) for x in items):
+        if any(title[:80].lower() == (x.get("title") or "")[:80].lower() for x in raw):
             return
         url = _normalize_news_url(link)
         if not url:
@@ -469,27 +545,28 @@ def fetch_news_intel(ticker: str, max_items: int = 6) -> dict[str, Any]:
             link_kind = "search_fallback"
         else:
             link_kind = "direct"
-        items.append(
+        raw.append(
             {
                 "title": title[:240],
                 "publisher": (str(publisher)[:80] if publisher else None),
                 "url": url,
                 "link_kind": link_kind,
-                "date": (str(date)[:32] if date else None),
+                "date": date_s,
+                "date_ts": float(date_ts or 0),
                 "source": source,
             }
         )
 
-    # --- 1) yfinance news ---
+    # --- 1) yfinance ---
     try:
         import yfinance as yf
 
         t = yf.Ticker(f"{ticker}.JK")
-        raw_news = getattr(t, "news", None) or []
-        for n in raw_news[: max_items + 3]:
+        for n in (getattr(t, "news", None) or [])[: max_items + 5]:
             if not isinstance(n, dict):
                 continue
             content = n.get("content") if isinstance(n.get("content"), dict) else None
+            date_ts = 0.0
             if content:
                 title = content.get("title") or content.get("summary") or ""
                 pub = content.get("provider") if isinstance(content.get("provider"), dict) else {}
@@ -500,77 +577,90 @@ def fetch_news_intel(ticker: str, max_items: int = 6) -> dict[str, Any]:
                     or ""
                 )
                 ts = content.get("pubDate") or content.get("displayTime") or ""
+                dt = _parse_rss_datetime(str(ts)) if ts else None
+                if dt:
+                    date_ts = dt.timestamp()
+                    date_s = dt.strftime("%Y-%m-%d %H:%M")
+                else:
+                    date_s = str(ts)[:32]
             else:
                 title = n.get("title") or ""
                 publisher = n.get("publisher") or ""
-                ts = n.get("providerPublishTime") or ""
+                ts = n.get("providerPublishTime") or 0
                 if isinstance(ts, (int, float)) and ts > 0:
                     try:
-                        ts = datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d")
+                        date_ts = float(ts)
+                        date_s = datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
                     except Exception:
-                        ts = str(ts)
-            link = _extract_yf_link(n)
-            _push(title, publisher, link, ts, "yfinance")
-            if len(items) >= max_items:
-                break
-        if any(x.get("source") == "yfinance" for x in items):
+                        date_s = str(ts)
+                else:
+                    date_s = None
+            _push(title, publisher, _extract_yf_link(n), date_s, date_ts, "yfinance")
+        if any(x.get("source") == "yfinance" for x in raw):
             sources_ok.append("yfinance")
     except Exception as e:
         errors.append(f"yfinance_news: {e}")
 
-    # --- 2) Google News RSS (ID) ---
-    if len(items) < max_items:
-        try:
-            q = urllib.parse.quote(f"{ticker} saham OR {ticker}.JK")
-            rss_url = (
-                "https://news.google.com/rss/search?"
-                f"q={q}&hl=id&gl=ID&ceid=ID:id"
+    # --- 2) Google News general (prioritas 7 hari) ---
+    try:
+        q = f"{ticker} (saham OR emiten OR IDX) when:7d"
+        for it in _fetch_google_news_rss(q, max_items=max_items + 4, label="google_news"):
+            _push(
+                it.get("title"),
+                it.get("publisher"),
+                it.get("url"),
+                it.get("date"),
+                it.get("date_ts"),
+                "google_news",
             )
-            req = urllib.request.Request(
-                rss_url,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; IDXAssistant/1.0)"},
-                method="GET",
+        if any(x.get("source") == "google_news" for x in raw):
+            sources_ok.append("google_news")
+    except Exception as e:
+        errors.append(f"google_news: {e}")
+
+    # --- 3) Google News fokus media ID ---
+    try:
+        q2 = (
+            f"{ticker} (saham OR IHSG) "
+            f"(site:cnbcindonesia.com OR site:kontan.co.id OR site:bisnis.com "
+            f"OR site:market.bisnis.com OR site:investasi.kontan.co.id) when:14d"
+        )
+        for it in _fetch_google_news_rss(q2, max_items=6, label="media_id"):
+            _push(
+                it.get("title"),
+                it.get("publisher"),
+                it.get("url"),
+                it.get("date"),
+                it.get("date_ts"),
+                "media_id",
             )
-            with urllib.request.urlopen(req, timeout=12) as r:
-                xml_bytes = r.read()
-            root = ET.fromstring(xml_bytes)
-            channel = root.find("channel")
-            rss_items = (
-                channel.findall("item") if channel is not None else root.findall(".//item")
-            )
-            for it in rss_items:
-                if len(items) >= max_items:
-                    break
-                title = (it.findtext("title") or "").strip()
-                link = (it.findtext("link") or "").strip()
-                # kadang URL ada di guid
-                if not link:
-                    guid = it.find("guid")
-                    if guid is not None and (guid.text or "").startswith("http"):
-                        link = guid.text.strip()
-                pub_date = (it.findtext("pubDate") or "").strip()
-                source_el = it.find("source")
-                publisher = (
-                    (source_el.text or "").strip() if source_el is not None else None
-                )
-                date_s = pub_date
-                try:
-                    date_s = parsedate_to_datetime(pub_date).strftime("%Y-%m-%d")
-                except Exception:
-                    date_s = pub_date[:16] if pub_date else None
-                _push(title, publisher, link, date_s, "google_news_rss")
-            if any(x.get("source") == "google_news_rss" for x in items):
-                sources_ok.append("google_news_rss")
-        except Exception as e:
-            errors.append(f"google_rss: {e}")
+        if any(x.get("source") == "media_id" for x in raw):
+            sources_ok.append("media_id")
+    except Exception as e:
+        errors.append(f"media_id: {e}")
+
+    # Sort terbaru dulu
+    raw.sort(key=lambda x: float(x.get("date_ts") or 0), reverse=True)
+
+    # Filter lookback opsional (keep items without date)
+    cutoff = now.timestamp() - hours_lookback * 3600
+    filtered = []
+    for it in raw:
+        ts = float(it.get("date_ts") or 0)
+        if ts <= 0 or ts >= cutoff:
+            filtered.append(it)
+    if not filtered:
+        filtered = raw
+
+    items = filtered[:max_items]
 
     pos_kw = (
         "naik", "tumbuh", "laba", "untung", "kontrak", "dividen", "buyback",
-        "ekspansi", "rekor", "positif", "upgrade", "net profit",
+        "ekspansi", "rekor", "positif", "upgrade", "net profit", "menguat",
     )
     neg_kw = (
         "turun", "rugi", "gagal", "sanksi", "default", "downgrade", "suspend",
-        "fraud", "korupsi", "investigasi", "bangkrut", "negatif",
+        "fraud", "korupsi", "investigasi", "bangkrut", "negatif", "melemah",
     )
     pos = neg = 0
     for it in items:
@@ -588,26 +678,92 @@ def fetch_news_intel(ticker: str, max_items: int = 6) -> dict[str, Any]:
     else:
         tone = "mixed_or_neutral"
 
-    # tautan pencarian master (selalu ada, untuk verifikasi manual)
-    verify_all_url = _fallback_search_url(ticker)
+    # strip date_ts from public payload (internal sort only) — keep for debug optional
+    public_items = []
+    for it in items:
+        public_items.append({k: v for k, v in it.items() if k != "date_ts"})
 
     return {
         "ticker": ticker,
-        "headlines": items[:max_items],
-        "headline_count": len(items[:max_items]),
+        "headlines": public_items,
+        "headline_count": len(public_items),
         "sources": sources_ok,
         "tone_hint": tone,
         "tone_counts": {"positive_kw": pos, "negative_kw": neg},
-        "verify_search_url": verify_all_url,
+        "verify_search_url": _fallback_search_url(ticker),
+        "fetched_at": fetched_at,
+        "hours_lookback": hours_lookback,
+        "realtime": True,
         "errors": errors,
         "disclaimer": (
-            "Headline otomatis; URL bisa berupa tautan langsung atau pencarian Google News. "
-            "Verifikasi ke sumber resmi (BEI/IDX/emiten). Bukan rekomendasi investasi."
+            "Berita near real-time dari agregator (Yahoo/Google News/media ID). "
+            "Bisa delay atau tidak lengkap. Verifikasi sumber resmi BEI/emiten. "
+            "Bukan rekomendasi investasi."
+        ),
+    }
+
+
+def fetch_market_news(max_items: int = 10) -> dict[str, Any]:
+    """Berita pasar umum IHSG / BEI untuk tab Kondisi Pasar."""
+    errors: list[str] = []
+    raw: list[dict] = []
+    sources_ok: list[str] = []
+    fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    queries = [
+        ("IHSG OR \"Bursa Efek\" OR BEI when:3d", "google_ihsg"),
+        (
+            "(IHSG OR saham) (site:cnbcindonesia.com OR site:kontan.co.id OR site:bisnis.com) when:5d",
+            "media_id",
+        ),
+    ]
+    for q, label in queries:
+        try:
+            for it in _fetch_google_news_rss(q, max_items=max_items, label=label):
+                title = (it.get("title") or "").strip()
+                if not title:
+                    continue
+                if any(title[:80].lower() == (x.get("title") or "")[:80].lower() for x in raw):
+                    continue
+                url = _normalize_news_url(it.get("url")) or (
+                    "https://news.google.com/search?q=" + title[:40]
+                )
+                raw.append(
+                    {
+                        "title": title[:240],
+                        "publisher": it.get("publisher"),
+                        "url": url,
+                        "link_kind": "direct" if it.get("url") else "search_fallback",
+                        "date": it.get("date"),
+                        "date_ts": float(it.get("date_ts") or 0),
+                        "source": label,
+                    }
+                )
+            sources_ok.append(label)
+        except Exception as e:
+            errors.append(f"{label}: {e}")
+
+    raw.sort(key=lambda x: float(x.get("date_ts") or 0), reverse=True)
+    items = [{k: v for k, v in it.items() if k != "date_ts"} for it in raw[:max_items]]
+
+    return {
+        "scope": "market",
+        "headlines": items,
+        "headline_count": len(items),
+        "sources": sources_ok,
+        "fetched_at": fetched_at,
+        "verify_search_url": (
+            "https://news.google.com/search?q=IHSG&hl=id&gl=ID&ceid=ID:id"
+        ),
+        "errors": errors,
+        "disclaimer": (
+            "Agregasi berita pasar near real-time. Bukan rekomendasi investasi."
         ),
     }
 
 
 def build_context(
+
 
     ticker: str,
     version: str,

@@ -464,6 +464,53 @@ with tab_pasar:
     if reg.get("strategies"):
         st.markdown(f"**Strategi disarankan:** `{', '.join(reg['strategies'])}`")
 
+    st.markdown("---")
+    st.markdown("##### 📰 Berita pasar (near real-time)")
+    col_n1, col_n2 = st.columns([1, 3])
+    with col_n1:
+        refresh_news = st.button("🔄 Muat berita IHSG", width="stretch", key="btn_market_news")
+    with col_n2:
+        st.caption("Sumber: Google News / media ID (CNBC, Kontan, Bisnis). Bukan feed BEI resmi.")
+
+    if refresh_news or st.session_state.get("market_news"):
+        if refresh_news or not st.session_state.get("market_news"):
+            with st.spinner("Mengambil berita pasar..."):
+                try:
+                    import idx_ai_assistant as _ai_news
+
+                    st.session_state["market_news"] = _ai_news.fetch_market_news(max_items=10)
+                except Exception as e:
+                    st.session_state["market_news"] = {
+                        "headlines": [],
+                        "errors": [str(e)],
+                        "fetched_at": None,
+                    }
+
+        mn = st.session_state.get("market_news") or {}
+        if mn.get("fetched_at"):
+            st.caption(f"Update: {mn.get('fetched_at')} · sumber: {', '.join(mn.get('sources') or [])}")
+        heads = mn.get("headlines") or []
+        if not heads:
+            st.info("Belum ada headline. Klik **Muat berita IHSG**.")
+            if mn.get("errors"):
+                st.caption("Error: " + "; ".join(mn["errors"][:3]))
+        else:
+            vurl = mn.get("verify_search_url")
+            if vurl:
+                st.markdown(f"[Buka pencarian IHSG di Google News]({vurl})")
+            for h in heads:
+                title = h.get("title") or "-"
+                url = h.get("url") or ""
+                pub = h.get("publisher") or h.get("source") or ""
+                date = h.get("date") or ""
+                meta = " · ".join(x for x in [pub, date] if x)
+                if url:
+                    st.markdown(f"- [{title}]({url})" + (f" — _{meta}_" if meta else ""))
+                else:
+                    st.markdown(f"- **{title}**" + (f" — _{meta}_" if meta else ""))
+            if mn.get("disclaimer"):
+                st.caption(mn["disclaimer"])
+
 # ---------- TAB 2: SCREENER ----------
 with tab_screener:
     st.subheader("📊 Screener")
@@ -779,7 +826,8 @@ with tab_ai:
             news = ctx.get("news_intel") or {}
             if news.get("headlines") or news.get("verify_search_url"):
                 with st.expander(
-                    f"Berita / web intel ({news.get('headline_count', 0)}) · tone={news.get('tone_hint', '?')}",
+                    f"Berita / web intel ({news.get('headline_count', 0)}) · tone={news.get('tone_hint', '?')}"
+                + (f" · {news.get('fetched_at')}" if news.get("fetched_at") else ""),
                     expanded=False,
                 ):
                     vurl = news.get("verify_search_url")
