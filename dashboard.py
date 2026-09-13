@@ -74,6 +74,8 @@ def _inject_streamlit_secrets() -> None:
         "XAI_BASE_URL",
         "OPENAI_MODEL",
         "XAI_MODEL",
+        "LLMQUANT_API_KEY",
+        "LLMQUANT_BASE_URL",
     ):
         try:
             if key in secrets and key not in os.environ:
@@ -478,7 +480,17 @@ with tab_pasar:
                 try:
                     import idx_ai_assistant as _ai_news
 
-                    st.session_state["market_news"] = _ai_news.fetch_market_news(max_items=10)
+                    if not hasattr(_ai_news, "fetch_market_news"):
+                        st.session_state["market_news"] = {
+                            "headlines": [],
+                            "errors": [
+                                "Modul idx_ai_assistant di Cloud belum punya fetch_market_news. "
+                                "Push versi terbaru file tersebut ke GitHub lalu reboot app."
+                            ],
+                            "fetched_at": None,
+                        }
+                    else:
+                        st.session_state["market_news"] = _ai_news.fetch_market_news(max_items=10)
                 except Exception as e:
                     st.session_state["market_news"] = {
                         "headlines": [],
@@ -510,6 +522,111 @@ with tab_pasar:
                     st.markdown(f"- **{title}**" + (f" — _{meta}_" if meta else ""))
             if mn.get("disclaimer"):
                 st.caption(mn["disclaimer"])
+
+    st.markdown("---")
+    st.markdown("##### 🌍 Makro global (LLMQuant)")
+    st.caption(
+        "Pelengkap narasi risk-on/off (data AS/global). "
+        "Bukan pengganti IHSG / data emiten BEI."
+    )
+    col_m1, col_m2 = st.columns([1, 3])
+    with col_m1:
+        load_macro = st.button("🔄 Muat makro LLMQuant", width="stretch", key="btn_llmquant_macro")
+    with col_m2:
+        try:
+            import idx_llmquant as _lq
+
+            if _lq.available():
+                st.success("LLMQUANT_API_KEY terdeteksi")
+            else:
+                st.info("Set `LLMQUANT_API_KEY` di Secrets / .env untuk mengaktifkan.")
+        except Exception:
+            st.warning("Modul `idx_llmquant.py` belum ada di project.")
+
+    if load_macro or st.session_state.get("llmquant_macro"):
+        if load_macro or not st.session_state.get("llmquant_macro"):
+            with st.spinner("Mengambil makro dari LLMQuant..."):
+                try:
+                    import idx_llmquant as _lq
+
+                    st.session_state["llmquant_macro"] = _lq.build_market_macro_pack()
+                except Exception as e:
+                    st.session_state["llmquant_macro"] = {
+                        "items": [],
+                        "errors": [str(e)],
+                        "fetched_at": None,
+                        "narrative_hint": "",
+                    }
+        mp = st.session_state.get("llmquant_macro") or {}
+        if mp.get("fetched_at"):
+            st.caption(f"Update: {mp.get('fetched_at')}")
+        if mp.get("narrative_hint"):
+            st.markdown(f"**Ringkas:** {mp['narrative_hint']}")
+        items = mp.get("items") or []
+        if items:
+            for it in items:
+                title = it.get("title") or it.get("indicator")
+                lv = it.get("latest_value")
+                ld = it.get("latest_date") or ""
+                dlt = it.get("delta_abs")
+                line = f"- **{title}**: {lv}"
+                if dlt is not None:
+                    line += f" (Δ {dlt})"
+                if ld:
+                    line += f" · _{ld}_"
+                st.markdown(line)
+        elif mp.get("errors"):
+            st.warning("Gagal memuat makro: " + "; ".join(str(x) for x in mp["errors"][:3]))
+            st.caption(
+                "Cek API key, kredit LLMQuant, dan apakah path REST masih sesuai docs."
+            )
+        if mp.get("disclaimer"):
+            st.caption(mp["disclaimer"])
+
+        st.markdown("---")
+        st.markdown("##### 🧠 Kesimpulan AI: makro global ↔ IHSG")
+        st.caption(
+            "Menilai transmisi suku bunga/inflasi/yield AS ke risk appetite IHSG. "
+            "Butuh data makro di atas; hasil lebih baik jika rezim IHSG sudah dicek."
+        )
+        gen_c = st.button(
+            "✍️ Buat kesimpulan korelasi IHSG",
+            width="stretch",
+            key="btn_macro_ihsg_conclusion",
+            disabled=not (mp.get("items") or mp.get("narrative_hint")),
+        )
+        if gen_c:
+            with st.spinner("Menyusun kesimpulan (LLM bila tersedia)..."):
+                try:
+                    import idx_llmquant as _lq
+
+                    conc = _lq.conclude_macro_vs_ihsg(
+                        macro=mp,
+                        regime=st.session_state.get("ihsg_regime") or {},
+                        use_llm=True,
+                    )
+                    st.session_state["macro_ihsg_conclusion"] = conc
+                except Exception as e:
+                    st.session_state["macro_ihsg_conclusion"] = {
+                        "mode": "error",
+                        "conclusion": "",
+                        "error": str(e),
+                    }
+
+        conc = st.session_state.get("macro_ihsg_conclusion")
+        if conc:
+            mode = conc.get("mode") or "-"
+            if mode == "llm":
+                st.success(f"Mode: LLM · {conc.get('fetched_at', '')}")
+            elif mode in ("heuristic", "heuristic_fallback"):
+                st.info(f"Mode: heuristik · {conc.get('fetched_at', '')}")
+                if conc.get("error"):
+                    st.caption(f"LLM gagal → fallback. Detail: {conc['error'][:200]}")
+            elif mode == "error":
+                st.error(conc.get("error") or "Gagal")
+            if conc.get("conclusion"):
+                st.markdown(conc["conclusion"])
+            st.caption("Bukan saran investasi. Korelasi makro–IHSG bersifat kontekstual dan dapat berubah.")
 
 # ---------- TAB 2: SCREENER ----------
 with tab_screener:
@@ -846,6 +963,23 @@ with tab_ai:
                             st.markdown(f"- **{title}**" + (f" — _{meta}_" if meta else ""))
                     if news.get("disclaimer"):
                         st.caption(news["disclaimer"])
+            lq = ctx.get("llmquant") or {}
+            if lq and not lq.get("skipped"):
+                with st.expander("LLMQuant (makro + quant wiki)", expanded=False):
+                    if (lq.get("macro") or {}).get("narrative_hint"):
+                        st.markdown(f"**Makro:** {lq['macro']['narrative_hint']}")
+                    wiki_items = (lq.get("quant_wiki") or {}).get("items") or []
+                    if wiki_items:
+                        st.markdown("**Quant Wiki:**")
+                        for w in wiki_items[:4]:
+                            st.markdown(
+                                f"- **{w.get('title') or '-'}** — {(w.get('summary') or '')[:180]}"
+                            )
+                    errs = list((lq.get("macro") or {}).get("errors") or []) + list(
+                        (lq.get("quant_wiki") or {}).get("errors") or []
+                    )
+                    if errs:
+                        st.caption("Note: " + "; ".join(str(e) for e in errs[:3]))
             with st.expander("Konteks JSON (debug)", expanded=False):
                 st.json(ctx)
             st.markdown("---")

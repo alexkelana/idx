@@ -126,15 +126,17 @@ Hanya gunakan data JSON yang diberikan. Jangan mengarang harga atau indikator.
 Fokus: kualitas setup (entry, SL, TP, RR), struktur, risiko false breakout/sweep,
 apakah level masuk akal untuk karakter BEI (tick, volatilitas).
 Rujuk angka di screener_row dan price_snapshot secara eksplisit.
+Jika ada llmquant.quant_wiki, boleh pakai sebagai kerangka istilah (OB, FVG, liquidity) tanpa mengarang level harga.
 Jawab dalam Bahasa Indonesia, terstruktur, poin-poin. Bukan saran investasi.""",
     "fundamental": """Kamu adalah analis fundamental saham Indonesia (IDX).
-Hanya gunakan field "fundamental", "news_intel", dan "screener_row" pada JSON.
+Hanya gunakan field "fundamental", "news_intel", "llmquant", dan "screener_row" pada JSON.
 Jika data terbatas/null, katakan secara eksplisit — jangan mengarang.
 Fokus:
 - Valuasi kasar (PE, PB, EPS, market cap) vs konteks sektor bila ada
 - Undervalued / fair / premium secara kualitatif dari angka yang ada
 - Risiko bisnis singkat (sektor, profitabilitas bila ada)
 - Ringkas berita/headline relevan di news_intel (katalis positif/negatif, corporate action)
+- Jika ada llmquant.quant_wiki / quant_papers: pakai hanya sebagai kerangka konsep quant (bukan fakta harga emiten)
 - Apakah fundamental + berita mendukung ATAU bertentangan dengan setup teknikal jangka pendek
 Jawab Bahasa Indonesia, poin-poin. Bukan saran investasi. Horizon: swing pendek–menengah.""",
     "risk": """Kamu adalah risk manager trading IDX.
@@ -145,19 +147,19 @@ likuiditas jika ada di data.
 Jawab Bahasa Indonesia, singkat, poin. Bukan saran investasi.""",
     "critic": """Kamu adalah devil's advocate / risk skeptic.
 Tugas: cari alasan setup ini GAGAL atau sebaiknya dihindari.
-Gabungkan celah teknikal, fundamental, DAN berita (news_intel):
-valuasi mahal, data kosong, sektor lemah, headline negatif, rumor tanpa konfirmasi.
+Gabungkan celah teknikal, fundamental, berita (news_intel), dan konteks makro/konsep di llmquant bila ada:
+valuasi mahal, data kosong, sektor lemah, headline negatif, makro global tidak mendukung risk-on.
 Sebut invalidation, skenario worst-case, dan red flags dari data JSON saja.
 Jangan mengarang berita di luar news_intel. Jangan memuji setup.
 Bahasa Indonesia, poin. Bukan saran investasi.""",
     "chief": """Kamu adalah head trader assistant yang merangkum analisa
-technical, fundamental, risk, critic, serta sinyal berita (news_intel).
+technical, fundamental, risk, critic, berita (news_intel), dan llmquant (makro/wiki quant) bila ada.
 Dari JSON gabungan tersebut, buat:
-1) Skor setup 1-10 (teknikal+risk dasar; fundamental/berita mendukung = bonus, bertentangan = penalti)
+1) Skor setup 1-10 (teknikal+risk dasar; fundamental/berita/makro mendukung = bonus, bertentangan = penalti)
 2) Bias: avoid | watch | consider  (jangan bilang "wajib beli/jual")
 3) Tiga syarat sebelum entry
-4) Tiga red flags (fundamental dan/atau berita bila relevan)
-5) Catatan fundamental + berita 2-3 kalimat (dukung / netral / bertentangan)
+4) Tiga red flags (fundamental, berita, atau makro global bila relevan)
+5) Catatan fundamental + berita + makro 2-3 kalimat
 6) Satu kalimat kesimpulan netral
 Hanya berdasarkan data yang ada; jangan mengarang headline.
 Bahasa Indonesia. Bukan financial advice.
@@ -776,6 +778,7 @@ def build_context(
     include_price_snapshot: bool = True,
     include_fundamental: bool = True,
     include_news: bool = True,
+    include_llmquant: bool = True,
 ) -> dict[str, Any]:
     ticker = str(ticker).upper().strip()
     df = load_report_df(version)
@@ -827,6 +830,29 @@ def build_context(
                 "headline_count": 0,
                 "errors": [str(e)],
                 "tone_hint": "unknown",
+            }
+    if include_llmquant:
+        try:
+            from idx_llmquant import build_llmquant_context_for_ticker
+
+            strategy_hint = None
+            ver = str(version).lower()
+            if "v4" in ver or "ob" in ver:
+                strategy_hint = "order block fair value gap institutional imbalance smart money concepts"
+            elif "v5" in ver or "choch" in ver:
+                strategy_hint = "change of character break of structure market structure shift liquidity"
+            elif "v2" in ver or "break" in ver:
+                strategy_hint = "breakout false breakout liquidity sweep momentum continuation"
+            elif "accum" in ver:
+                strategy_hint = "accumulation spring liquidity grab range compression volume"
+            ctx["llmquant"] = build_llmquant_context_for_ticker(
+                ticker, strategy_hint=strategy_hint
+            )
+        except Exception as e:
+            ctx["llmquant"] = {
+                "available": False,
+                "errors": [str(e)],
+                "skipped": "idx_llmquant tidak tersedia atau gagal",
             }
     return ctx
 
@@ -1113,6 +1139,7 @@ def analyze_ticker(
     model: str | None = None,
     include_fundamental: bool = True,
     include_news: bool = True,
+    include_llmquant: bool = True,
 ) -> dict[str, Any]:
     ctx = build_context(
         ticker,
@@ -1124,6 +1151,7 @@ def analyze_ticker(
         broker_sell_pct=broker_sell_pct,
         include_fundamental=include_fundamental,
         include_news=include_news,
+        include_llmquant=include_llmquant,
     )
     if not ctx.get("screener_row"):
         return {
