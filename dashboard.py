@@ -442,6 +442,36 @@ with tab_pasar:
     for r in reg.get("activity_reason") or []:
         st.caption(r)
 
+    # --- Bias operasional (arah kerja) ---
+    bias = reg.get("bias")
+    if bias:
+        bias_label = {
+            "BULLISH": "🟢 BULLISH — prioritaskan setup long / breakout (sesuai strategi)",
+            "SEDIKIT_BULLISH": "🟡 SEDIKIT BULLISH — long selektif, konfirmasi wajib",
+            "NETRAL": "⚪ NETRAL — range/rotasi; hindari FOMO, tunggu trigger jelas",
+            "SEDIKIT_BEARISH": "🟠 SEDIKIT BEARISH — kurangi agresivitas long; defensif",
+            "BEARISH": "🔴 BEARISH — bias hati-hati / cash / setup khusus downtrend",
+        }.get(str(bias), str(bias))
+        if "BULLISH" in str(bias) and "SEDIKIT" not in str(bias):
+            st.success(f"**Bias pasar: {bias_label}**")
+        elif "BEARISH" in str(bias) and "SEDIKIT" not in str(bias):
+            st.error(f"**Bias pasar: {bias_label}**")
+        elif "SEDIKIT_BULLISH" in str(bias):
+            st.success(f"**Bias pasar: {bias_label}**")
+        elif "SEDIKIT_BEARISH" in str(bias):
+            st.warning(f"**Bias pasar: {bias_label}**")
+        else:
+            st.info(f"**Bias pasar: {bias_label}**")
+        if reg.get("bias_score") is not None:
+            st.caption(f"Bias score: {reg.get('bias_score')}")
+        for r in reg.get("bias_reason") or []:
+            st.caption(f"• {r}")
+    elif str(regime) not in ("Belum dicek", "UNKNOWN", ""):
+        st.caption(
+            "Bias belum tersedia di hasil rezim ini — jalankan ulang **Cek Rezim** "
+            "setelah update `master_screener_ai.py`."
+        )
+
     if reg.get("vol_ratio_20") is not None:
         st.caption(
             f"Vol IHSG: {reg['vol_ratio_20']}x avg20 · "
@@ -877,6 +907,9 @@ with tab_ai:
                 for k in (
                     "regime",
                     "activity",
+                    "bias",
+                    "bias_score",
+                    "bias_reason",
                     "strategies",
                     "last_close",
                     "reason",

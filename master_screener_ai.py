@@ -400,11 +400,68 @@ def analyze_ihsg_regime(lookback_days: int = 180) -> dict:
         print("Vol ratio      : n/a (volume indeks tidak valid)")
     if atr_ratio is not None:
         print(f"ATR5/ATR14     : {atr_ratio:.2f}")
+    # =================================================================
+    # BIAS OPERASIONAL (arah kerja day/swing trader)
+    # Gabungan rezim struktur + aktivitas (bukan sinyal emiten)
+    # =================================================================
+    bias = "NETRAL"
+    bias_score = 0
+    bias_reason: list[str] = []
+
+    if regime == "BULLISH_STRONG":
+        bias_score += 2
+        bias_reason.append("Struktur bullish kuat (stack MA + dekat high).")
+    elif regime == "BULLISH_PULLBACK":
+        bias_score += 1
+        bias_reason.append("Pullback dalam struktur menengah bullish.")
+    elif regime == "BEARISH_STRONG":
+        bias_score -= 2
+        bias_reason.append("Downtrend kuat / dekat low — bias defensif.")
+    elif regime == "BEARISH_WEAK":
+        bias_score -= 1
+        bias_reason.append("Tekanan jual di bawah MA20/MA50.")
+    else:
+        bias_reason.append("Sideways / rotasi — tidak ada edge arah yang jelas.")
+
+    if activity == "RAMAI":
+        # Aktivitas tinggi memperkuat arah yang sudah ada; di sideways = waspada chop
+        if bias_score > 0:
+            bias_score += 1
+            bias_reason.append("Aktivitas RAMAI memperkuat bias naik.")
+        elif bias_score < 0:
+            bias_score -= 1
+            bias_reason.append("Aktivitas RAMAI memperkuat tekanan turun.")
+        else:
+            bias_reason.append("Aktivitas RAMAI di sideways — waspada false breakout.")
+    elif activity == "SEPI":
+        if bias_score > 0:
+            bias_score -= 1
+            bias_reason.append("Pasar SEPI mengurangi keyakinan long agresif.")
+        elif bias_score < 0:
+            bias_score += 1
+            bias_reason.append("Pasar SEPI mengurangi keyakinan short/panic.")
+        else:
+            bias_reason.append("Pasar SEPI + sideways — fokus selektif / tunggu trigger.")
+
+    if bias_score >= 2:
+        bias = "BULLISH"
+    elif bias_score == 1:
+        bias = "SEDIKIT_BULLISH"
+    elif bias_score <= -2:
+        bias = "BEARISH"
+    elif bias_score == -1:
+        bias = "SEDIKIT_BEARISH"
+    else:
+        bias = "NETRAL"
+
     print(f"Rezim Pasar    : ** {regime} **")
     for r in reason:
         print(f"  - {r}")
     print(f"Aktivitas      : ** {activity} ** (score={score})")
     for r in activity_reason:
+        print(f"  - {r}")
+    print(f"Bias           : ** {bias} ** (score={bias_score})")
+    for r in bias_reason:
         print(f"  - {r}")
     print(f"Strategi       : {', '.join(strategies)}")
 
@@ -423,6 +480,9 @@ def analyze_ihsg_regime(lookback_days: int = 180) -> dict:
         "range_20_pct": round(range_20_pct, 2),
         "atr_ratio": round(atr_ratio, 2) if atr_ratio is not None else None,
         "activity_score": score,
+        "bias": bias,
+        "bias_score": bias_score,
+        "bias_reason": bias_reason,
     }
 
 
