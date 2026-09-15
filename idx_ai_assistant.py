@@ -125,7 +125,18 @@ SYSTEM_PROMPTS = {
 Hanya gunakan data JSON yang diberikan. Jangan mengarang harga atau indikator.
 Fokus: kualitas setup (entry, SL, TP, RR), struktur, risiko false breakout/sweep,
 apakah level masuk akal untuk karakter BEI (tick, volatilitas).
-Rujuk angka di screener_row dan price_snapshot secara eksplisit.
+Rujuk angka di screener_row, price_snapshot, dan ma_structure secara eksplisit.
+
+WAJIB bahas field ma_structure bila available=true:
+- Nilai MA20 / MA50 / MA100 / MA200 dan last_close
+- Harga di atas atau di bawah masing-masing MA (price_vs_ma + dist_pct)
+- Susunan MA (stack) bullish/bearish/campur
+- Golden cross atau death cross (crosses): pasangan mana, direction_last_cross,
+  days_since_cross, apakah cross_fresh (≤10h) / cross_recent (≤30h) / sudah lama
+- Slope MA20 (ma20_slope_5d_pct) bila ada
+- Kaitkan dengan setup screener: mendukung, netral, atau bertentangan
+
+Jika ma_structure.available=false, sebut data MA tidak tersedia — jangan mengarang.
 Jika ada llmquant.quant_wiki, boleh pakai sebagai kerangka istilah (OB, FVG, liquidity) tanpa mengarang level harga.
 Jawab dalam Bahasa Indonesia, terstruktur, poin-poin. Bukan saran investasi.""",
     "fundamental": """Kamu adalah analis fundamental saham Indonesia (IDX).
@@ -138,6 +149,9 @@ Fokus:
 - Ringkas berita/headline relevan di news_intel (katalis positif/negatif, corporate action)
 - Jika ada llmquant.quant_wiki / quant_papers: pakai hanya sebagai kerangka konsep quant (bukan fakta harga emiten)
 - Apakah fundamental + berita mendukung ATAU bertentangan dengan setup teknikal jangka pendek
+WAJIB sebutkan fundamental.source dan fundamental.confidence.
+Jika source=yfinance atau confidence=low/medium: tekankan ketidakpastian data IDX di Yahoo,
+sarankan verifikasi manual lewat fundamental.sectors_company_url / sectors_news_url, dan jangan overconfident pada PE/PB.
 Jawab Bahasa Indonesia, poin-poin. Bukan saran investasi. Horizon: swing pendek–menengah.""",
     "risk": """Kamu adalah risk manager trading IDX.
 Hanya gunakan data JSON yang diberikan.
@@ -154,16 +168,47 @@ Jangan mengarang berita di luar news_intel. Jangan memuji setup.
 Bahasa Indonesia, poin. Bukan saran investasi.""",
     "chief": """Kamu adalah head trader assistant yang merangkum analisa
 technical, fundamental, risk, critic, berita (news_intel), dan llmquant (makro/wiki quant) bila ada.
-Dari JSON gabungan tersebut, buat:
-1) Skor setup 1-10 (teknikal+risk dasar; fundamental/berita/makro mendukung = bonus, bertentangan = penalti)
-2) Bias: avoid | watch | consider  (jangan bilang "wajib beli/jual")
-3) Tiga syarat sebelum entry
-4) Tiga red flags (fundamental, berita, atau makro global bila relevan)
-5) Catatan fundamental + berita + makro 2-3 kalimat
-6) Satu kalimat kesimpulan netral
+
+WAJIB output bagian **SCORECARD BIAS** di paling atas, format persis seperti ini
+(ganti TICKER, arah, dan % sesuai penilaianmu dari data — jangan mengarang angka harga):
+
+### SCORECARD BIAS — {TICKER}
+- Teknikal: {Bullish|Bearish|Netral} {0-100}%
+- Berita: {Bullish|Bearish|Netral} {0-100}%
+- Fundamental: {Bullish|Bearish|Netral} {0-100}%
+- **Overall: {Bullish|Bearish|Netral} {0-100}%** · rekomendasi stance: {avoid|watch|consider}
+- Fundamental confidence: {high|medium|low} ({fundamental.source})
+- Berita Sectors (filter emiten): {news_intel.sectors_news_url}
+- Profil/fundamental Sectors (verifikasi manual): {fundamental.sectors_company_url}
+
+Aturan skor %:
+- Teknikal: kualitas setup entry/SL/TP/RR, struktur, risiko false breakout, serta posisi harga vs MA / golden-death cross dari ma_structure (dari analisa technical + risk).
+- Berita: tone_hint + headline di news_intel (+ critic bila relevan). Jika headline kosong → Netral 50% dan sebut data terbatas.
+- Fundamental: valuasi/PE-PB/EPS dari field fundamental. Jika data null → Netral 50% dan sebut data terbatas.
+- **Penalti confidence yfinance (WAJIB):**
+  - Jika fundamental.source == "yfinance" ATAU fundamental.confidence in ("low","medium"):
+    - Bobot fundamental di Overall diturunkan (pakai ~15% bukan 30%; teknikal ~50%, berita ~35%).
+    - Jangan biarkan skor Fundamental ekstrem (>75 atau <25) hanya dari PE/PB Yahoo — clamp ke kisaran 40–60 kecuali berita/analisa lain sangat mendukung.
+    - Cantumkan di scorecard: `confidence: low (yfinance — verifikasi manual)`.
+  - Jika source idx_fundamental / override / sectors: confidence high/medium, bobot normal (~30%).
+- Overall: rata tertimbang sesuai aturan di atas, lalu sesuaikan jika critic/makro sangat negatif atau positif.
+- Jangan pernah tulis "wajib beli/jual". Overall hanya avoid | watch | consider.
+- Setelah Overall, WAJIB dua baris deep-link Sectors (salin URL dari JSON bila ada):
+  - Berita Sectors (filter emiten): {news_intel.sectors_news_url}
+  - Profil/fundamental Sectors (verifikasi manual): {fundamental.sectors_company_url}
+  Jika URL kosong, gunakan:
+  - https://sectors.app/indonesia/news?nticker={TICKER}.JK
+  - https://sectors.app/idx/{ticker_lower}   (contoh ANTM → https://sectors.app/idx/antm)
+
+Setelah scorecard, lanjutkan:
+1) Skor setup 1-10 (satu angka + 1 kalimat alasan)
+2) Tiga syarat sebelum entry
+3) Tiga red flags
+4) Catatan singkat fundamental + berita + makro (2-3 kalimat)
+5) Satu kalimat kesimpulan netral
+
 Hanya berdasarkan data yang ada; jangan mengarang headline.
-Bahasa Indonesia. Bukan financial advice.
-Format output jelas dengan heading singkat.""",
+Bahasa Indonesia. Bukan financial advice.""",
 }
 
 
@@ -223,6 +268,165 @@ def _row_to_dict(row: pd.Series) -> dict:
         else:
             out[k] = v if not isinstance(v, (pd.Timestamp,)) else str(v)
     return out
+
+
+def _cross_events(
+    short: "pd.Series",
+    long: "pd.Series",
+    *,
+    lookback: int = 60,
+) -> dict[str, Any]:
+    """Deteksi golden/death cross terbaru antara dua MA."""
+    s = short.dropna()
+    l = long.dropna()
+    common = s.index.intersection(l.index)
+    if len(common) < 5:
+        return {"status": "unknown", "days_since": None, "direction": None}
+    s = s.loc[common]
+    l = l.loc[common]
+    above = s > l
+    # cari perubahan status dari belakang
+    days_since = None
+    direction = None
+    for i in range(len(above) - 1, 0, -1):
+        if bool(above.iloc[i]) != bool(above.iloc[i - 1]):
+            days_since = len(above) - 1 - i
+            direction = "golden" if bool(above.iloc[i]) else "death"
+            break
+        if (len(above) - 1 - i) >= lookback:
+            break
+    status = "short_above_long" if bool(above.iloc[-1]) else "short_below_long"
+    return {
+        "status": status,
+        "direction_last_cross": direction,
+        "days_since_cross": days_since,
+        "cross_fresh": days_since is not None and days_since <= 10,
+        "cross_recent": days_since is not None and days_since <= 30,
+    }
+
+
+def fetch_ma_structure(ticker: str, days: int = 200) -> dict[str, Any]:
+    """
+    MA signifikan emiten: MA20/50/100/200, posisi harga vs MA,
+    golden/death cross, seberapa baru.
+    """
+    out: dict[str, Any] = {
+        "ticker": str(ticker).upper().strip(),
+        "available": False,
+        "source": "yfinance",
+    }
+    try:
+        import yfinance as yf
+
+        df = yf.download(
+            f"{out['ticker']}.JK",
+            period=f"{max(days, 220)}d",
+            interval="1d",
+            progress=False,
+            auto_adjust=True,
+            multi_level_index=False,
+        )
+        if df is None or df.empty or len(df) < 30:
+            out["error"] = "data historis tidak cukup"
+            return out
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        c = pd.to_numeric(df["Close"], errors="coerce")
+        last = float(c.iloc[-1])
+        ma20 = c.rolling(20).mean()
+        ma50 = c.rolling(50).mean()
+        ma100 = c.rolling(100).mean()
+        ma200 = c.rolling(200).mean()
+
+        def _last(series):
+            v = series.iloc[-1]
+            return None if pd.isna(v) else round(float(v), 2)
+
+        m20, m50, m100, m200 = _last(ma20), _last(ma50), _last(ma100), _last(ma200)
+
+        def _pos(price, ma):
+            if ma is None or ma == 0:
+                return None
+            return {
+                "above": price > ma,
+                "dist_pct": round((price / ma - 1) * 100, 2),
+            }
+
+        stack_notes = []
+        if m20 and m50 and m100:
+            if m20 > m50 > m100:
+                stack_notes.append("susunan bullish: MA20 > MA50 > MA100")
+            elif m20 < m50 < m100:
+                stack_notes.append("susunan bearish: MA20 < MA50 < MA100")
+            else:
+                stack_notes.append("susunan MA campur / rotasi")
+
+        cross_20_50 = _cross_events(ma20, ma50)
+        cross_50_100 = _cross_events(ma50, ma100) if m100 is not None else {}
+        cross_50_200 = _cross_events(ma50, ma200) if m200 is not None else {}
+
+        # slope kasar MA20 (5 hari)
+        slope_ma20 = None
+        if len(ma20.dropna()) >= 6:
+            a = float(ma20.dropna().iloc[-1])
+            b = float(ma20.dropna().iloc[-6])
+            if b:
+                slope_ma20 = round((a / b - 1) * 100, 2)
+
+        out.update(
+            {
+                "available": True,
+                "last_close": round(last, 2),
+                "bars": int(len(df)),
+                "ma": {
+                    "MA20": m20,
+                    "MA50": m50,
+                    "MA100": m100,
+                    "MA200": m200,
+                },
+                "price_vs_ma": {
+                    "vs_MA20": _pos(last, m20),
+                    "vs_MA50": _pos(last, m50),
+                    "vs_MA100": _pos(last, m100),
+                    "vs_MA200": _pos(last, m200),
+                },
+                "ma20_slope_5d_pct": slope_ma20,
+                "stack": stack_notes,
+                "crosses": {
+                    "MA20_vs_MA50": cross_20_50,
+                    "MA50_vs_MA100": cross_50_100,
+                    "MA50_vs_MA200": cross_50_200,
+                },
+                "interpretation_hints": [],
+            }
+        )
+        hints = out["interpretation_hints"]
+        for label, pos in (out["price_vs_ma"] or {}).items():
+            if not pos:
+                continue
+            side = "di atas" if pos["above"] else "di bawah"
+            hints.append(f"Harga {side} {label.replace('vs_', '')} (jarak {pos['dist_pct']}%).")
+        for name, cx in (out["crosses"] or {}).items():
+            if not cx or not cx.get("direction_last_cross"):
+                continue
+            d = cx["direction_last_cross"]
+            days = cx.get("days_since_cross")
+            age = (
+                "baru saja (≤10 hari)"
+                if cx.get("cross_fresh")
+                else (
+                    "relatif baru (≤30 hari)"
+                    if cx.get("cross_recent")
+                    else f"sudah lama ({days} hari lalu)" if days is not None else "usia tidak jelas"
+                )
+            )
+            kind = "Golden cross" if d == "golden" else "Death cross"
+            hints.append(f"{kind} pada {name}: {age}.")
+        return out
+    except Exception as e:
+        out["error"] = str(e)
+        return out
 
 
 def _price_snapshot(ticker: str, days: int = 60) -> dict | None:
@@ -291,10 +495,119 @@ def _classify_valuation(pe: float | None, pb: float | None) -> str:
     return "; ".join(notes) if notes else "valuasi tidak dapat disimpulkan dari data"
 
 
-def fetch_fundamental(ticker: str) -> dict[str, Any]:
-    """Ambil fundamental: idx_fundamental (jika ada) lalu yfinance."""
-    ticker = str(ticker).upper().strip()
+def _sectors_urls(ticker: str) -> dict[str, str]:
+    """Deep-link Sectors (tanpa scrape). Profil: /idx/{ticker_lower}."""
+    t = str(ticker).upper().strip().replace(".JK", "")
+    slug = t.lower()
+    return {
+        "sectors_company_url": f"https://sectors.app/idx/{slug}",
+        "sectors_news_url": f"https://sectors.app/indonesia/news?nticker={t}.JK",
+    }
 
+
+def _load_fundamentals_override(ticker: str) -> dict[str, Any] | None:
+    """
+    Baca fundamentals_override.csv (prioritas tertinggi).
+    Kolom yang dikenali (case-insensitive):
+      Ticker, PE, PB, EPS, ROE, MarketCap, Sector, Industry, Name,
+      DividendYield, DebtToEquity, ProfitMargin, AsOf, Source, Notes
+    File dicari di working dir, folder skrip, dan artifacts.
+    """
+    t = str(ticker).upper().strip().replace(".JK", "")
+    candidates: list[str] = []
+    for d in _search_dirs():
+        candidates.append(os.path.join(d, "fundamentals_override.csv"))
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates.insert(0, os.path.join(here, "fundamentals_override.csv"))
+    except Exception:
+        pass
+
+    path = next((p for p in candidates if os.path.isfile(p)), None)
+    if not path:
+        return None
+
+    try:
+        df = pd.read_csv(path, index_col=False)
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+    df.columns = [str(c).strip() for c in df.columns]
+    # restore jika Ticker ikut jadi index
+    if "Ticker" not in df.columns and "ticker" not in [c.lower() for c in df.columns]:
+        df = df.reset_index()
+        df.columns = [str(c).strip() for c in df.columns]
+    colmap = {str(c).strip().lower(): c for c in df.columns}
+    tcol = colmap.get("ticker")
+    if not tcol:
+        return None
+
+    def _cell(row, *keys):
+        for k in keys:
+            c = colmap.get(k.lower())
+            if c is not None and c in row.index:
+                v = row[c]
+                if pd.isna(v):
+                    continue
+                return v
+        return None
+
+    hit = df[df[tcol].astype(str).str.upper().str.replace(".JK", "", regex=False) == t]
+    if hit.empty:
+        return None
+    row = hit.iloc[0]
+    pe = _safe_float(_cell(row, "pe", "pe_ratio", "trailing_pe"))
+    pb = _safe_float(_cell(row, "pb", "pb_ratio", "price_to_book"))
+    eps = _safe_float(_cell(row, "eps"))
+    roe = _safe_float(_cell(row, "roe"))
+    mcap = _safe_float(_cell(row, "marketcap", "market_cap"))
+    div_y = _safe_float(_cell(row, "dividendyield", "dividend_yield", "dividend_yield_pct"))
+    debt = _safe_float(_cell(row, "debttoequity", "debt_to_equity"))
+    pm = _safe_float(_cell(row, "profitmargin", "profit_margin", "profit_margin_pct"))
+    urls = _sectors_urls(t)
+    src = str(_cell(row, "source") or "fundamentals_override").strip()
+    out: dict[str, Any] = {
+        "ticker": t,
+        "available": True,
+        "source": src,
+        "confidence": "high",
+        "confidence_note": "Data dari fundamentals_override.csv (kurasi manual).",
+        "name": _cell(row, "name", "company_name"),
+        "sector": _cell(row, "sector"),
+        "industry": _cell(row, "industry"),
+        "currency": "IDR",
+        "market_cap": int(mcap) if mcap else None,
+        "pe_ratio": round(pe, 2) if pe is not None else None,
+        "pb_ratio": round(pb, 2) if pb is not None else None,
+        "eps": round(eps, 2) if eps is not None else None,
+        "roe": round(roe, 2) if roe is not None else None,
+        "profit_margin_pct": round(pm, 2) if pm is not None else None,
+        "debt_to_equity": round(debt, 2) if debt is not None else None,
+        "dividend_yield_pct": round(div_y, 2) if div_y is not None else None,
+        "as_of": _cell(row, "asof", "as_of", "date"),
+        "notes": _cell(row, "notes", "note"),
+        "valuation_note": _classify_valuation(pe, pb),
+        "override_file": path,
+        **urls,
+        "disclaimer": "Override manual — pastikan AsOf dan angka sesuai laporan terkini.",
+    }
+    return out
+
+
+def fetch_fundamental(ticker: str) -> dict[str, Any]:
+    """Ambil fundamental: override CSV → idx_fundamental → yfinance."""
+    ticker = str(ticker).upper().strip().replace(".JK", "")
+
+    # 1) CSV override (prioritas tertinggi)
+    try:
+        ov = _load_fundamentals_override(ticker)
+        if ov:
+            return ov
+    except Exception:
+        pass
+
+    # 2) Modul lokal idx_fundamental
     try:
         from idx_fundamental import get_fundamental_snapshot  # type: ignore
 
@@ -302,6 +615,10 @@ def fetch_fundamental(ticker: str) -> dict[str, Any]:
         if isinstance(snap, dict) and snap:
             snap = dict(snap)
             snap.setdefault("source", "idx_fundamental")
+            snap.setdefault("confidence", "high")
+            urls = _sectors_urls(ticker)
+            snap.setdefault("sectors_company_url", urls["sectors_company_url"])
+            snap.setdefault("sectors_news_url", urls["sectors_news_url"])
             return snap
     except Exception:
         pass
@@ -349,9 +666,31 @@ def fetch_fundamental(ticker: str) -> dict[str, Any]:
         if roe is not None:
             roe_out = round(roe * 100, 2) if abs(roe) <= 1 else round(roe, 2)
 
+        filled = sum(
+            1
+            for x in (pe, pb, eps, mcap, roe)
+            if x is not None
+        )
+        confidence = "low"
+        if filled >= 4:
+            confidence = "medium"
+        # yfinance IDX tetap max medium — jangan high
+
+        urls = _sectors_urls(ticker)
+        sectors_company_url = urls["sectors_company_url"]
+        sectors_news_url = urls["sectors_news_url"]
+
         out.update(
             {
                 "available": bool(info),
+                "source": "yfinance",
+                "confidence": confidence,
+                "confidence_note": (
+                    "Sumber yfinance sering tidak akurat untuk emiten IDX. "
+                    "Verifikasi PE/PB/EPS di Sectors atau laporan resmi sebelum diandalkan."
+                ),
+                "sectors_company_url": sectors_company_url,
+                "sectors_news_url": sectors_news_url,
                 "name": info.get("longName") or info.get("shortName"),
                 "sector": info.get("sector"),
                 "industry": info.get("industry"),
@@ -685,6 +1024,10 @@ def fetch_news_intel(
     for it in items:
         public_items.append({k: v for k, v in it.items() if k != "date_ts"})
 
+    # Tautan Sectors (filter emiten) — tanpa scraping, hanya deep-link UI
+    sectors_ticker = f"{ticker}.JK"
+    sectors_news_url = f"https://sectors.app/indonesia/news?nticker={sectors_ticker}"
+
     return {
         "ticker": ticker,
         "headlines": public_items,
@@ -693,12 +1036,14 @@ def fetch_news_intel(
         "tone_hint": tone,
         "tone_counts": {"positive_kw": pos, "negative_kw": neg},
         "verify_search_url": _fallback_search_url(ticker),
+        "sectors_news_url": sectors_news_url,
         "fetched_at": fetched_at,
         "hours_lookback": hours_lookback,
         "realtime": True,
         "errors": errors,
         "disclaimer": (
             "Berita near real-time dari agregator (Yahoo/Google News/media ID). "
+            "Link Sectors hanya deep-link UI (bukan scrape). "
             "Bisa delay atau tidak lengkap. Verifikasi sumber resmi BEI/emiten. "
             "Bukan rekomendasi investasi."
         ),
@@ -815,6 +1160,15 @@ def build_context(
         snap = _price_snapshot(ticker)
         if snap:
             ctx["price_snapshot"] = snap
+        # MA signifikan + golden/death cross (data terpisah, horizon lebih panjang)
+        try:
+            ctx["ma_structure"] = fetch_ma_structure(ticker)
+        except Exception as e:
+            ctx["ma_structure"] = {
+                "ticker": ticker,
+                "available": False,
+                "error": str(e),
+            }
     if include_fundamental:
         fund = fetch_fundamental(ticker)
         if csv_fund:
@@ -1080,6 +1434,56 @@ def run_role(role: str, context: dict, *, model: str | None = None) -> str:
     )
 
 
+def _ensure_sectors_link_in_chief(chief_text: str, context: dict) -> str:
+    """Sisipkan deep-link Sectors (berita + profil) setelah Overall di scorecard Chief."""
+    text = chief_text or ""
+    t = str(context.get("ticker") or "TICKER").upper().strip()
+    news = context.get("news_intel") or {}
+    fund = context.get("fundamental") or {}
+
+    news_url = news.get("sectors_news_url") or fund.get("sectors_news_url")
+    if not news_url:
+        news_url = f"https://sectors.app/indonesia/news?nticker={t}.JK"
+    company_url = fund.get("sectors_company_url")
+    if not company_url:
+        company_url = _sectors_urls(t)["sectors_company_url"]
+
+    conf = fund.get("confidence") or (
+        "low" if str(fund.get("source", "")).lower() == "yfinance" else None
+    )
+    src = fund.get("source") or "unknown"
+    conf_line = None
+    if conf or src:
+        conf_line = f"- Fundamental confidence: {conf or 'n/a'} ({src})"
+
+    line_news = f"- Berita Sectors (filter emiten): {news_url}"
+    line_co = f"- Profil/fundamental Sectors (verifikasi manual): {company_url}"
+
+    lines = text.splitlines()
+    out: list[str] = []
+    inserted = False
+    for ln in lines:
+        # drop old auto lines so we can re-insert cleanly
+        if (
+            "Berita Sectors" in ln
+            or "Profil/fundamental Sectors" in ln
+            or "Fundamental confidence:" in ln
+        ):
+            continue
+        out.append(ln)
+        if not inserted and "Overall:" in ln:
+            if conf_line:
+                out.append(conf_line)
+            out.append(line_news)
+            out.append(line_co)
+            inserted = True
+    if not inserted:
+        block = ([conf_line] if conf_line else []) + [line_news, line_co, ""]
+        out = block + out
+    return "\n".join(out)
+
+
+
 def run_agents(
     context: dict,
     *,
@@ -1114,6 +1518,11 @@ def run_agents(
             except Exception as e:
                 errors["chief"] = _format_llm_error(e)
                 analyses["chief"] = f"[Gagal] {errors['chief']}"
+            else:
+                # Pastikan link Sectors selalu ada setelah Overall di scorecard
+                analyses["chief"] = _ensure_sectors_link_in_chief(
+                    analyses["chief"], context
+                )
 
     return {
         "ticker": context.get("ticker"),

@@ -99,6 +99,39 @@ st.markdown(
 )
 
 # Semua kunci report yang dikenali dashboard
+
+
+def _colorize_bias_text(md: str) -> str:
+    """Warnai kata Bullish/Bearish/Netral di teks analisa (HTML untuk Streamlit)."""
+    if not md:
+        return md
+    import re as _re
+
+    s = str(md)
+
+    def repl_bull(m):
+        return f'<span style="color:#16a34a;font-weight:600">{m.group(0)}</span>'
+
+    def repl_bear(m):
+        return f'<span style="color:#dc2626;font-weight:600">{m.group(0)}</span>'
+
+    def repl_net(m):
+        return f'<span style="color:#ca8a04;font-weight:600">{m.group(0)}</span>'
+
+    s = _re.sub(r"(?i)\b(sedikit\s+bullish|bullish)\b", repl_bull, s)
+    s = _re.sub(r"(?i)\b(sedikit\s+bearish|bearish)\b", repl_bear, s)
+    s = _re.sub(r"(?i)\b(netral)\b", repl_net, s)
+    return s
+
+
+def _md_bias(md: str) -> None:
+    """Render markdown dengan highlight bias bullish/bearish."""
+    try:
+        st.markdown(_colorize_bias_text(md), unsafe_allow_html=True)
+    except Exception:
+        st.markdown(md)
+
+
 REPORT_VERSIONS = [
     "v2",
     "v3",
@@ -655,7 +688,7 @@ with tab_pasar:
             elif mode == "error":
                 st.error(conc.get("error") or "Gagal")
             if conc.get("conclusion"):
-                st.markdown(conc["conclusion"])
+                _md_bias(conc["conclusion"])
             st.caption("Bukan saran investasi. Korelasi makro–IHSG bersifat kontekstual dan dapat berubah.")
 
 # ---------- TAB 2: SCREENER ----------
@@ -967,14 +1000,33 @@ with tab_ai:
             analyses = out.get("analyses") or {}
             if analyses.get("chief"):
                 st.markdown("**Chief (ringkasan)**")
-                st.markdown(analyses["chief"])
+                _md_bias(analyses["chief"])
             for role in ("technical", "fundamental", "risk", "critic"):
                 if analyses.get(role):
                     with st.expander(f"{role.capitalize()}", expanded=(role == "technical")):
-                        st.markdown(analyses[role])
+                        _md_bias(analyses[role])
             ctx = out.get("context") or {}
+            ma = ctx.get("ma_structure") or {}
+            if ma.get("available"):
+                with st.expander("Struktur MA (data live)", expanded=False):
+                    m = ma.get("ma") or {}
+                    st.caption(
+                        f"Close {ma.get('last_close')} · "
+                        f"MA20={m.get('MA20')} · MA50={m.get('MA50')} · "
+                        f"MA100={m.get('MA100')} · MA200={m.get('MA200')}"
+                    )
+                    for h in ma.get("interpretation_hints") or []:
+                        st.markdown(f"- {h}")
+                    for name, cx in (ma.get("crosses") or {}).items():
+                        if not cx:
+                            continue
+                        st.caption(
+                            f"{name}: {cx.get('status')} · "
+                            f"cross={cx.get('direction_last_cross')} · "
+                            f"hari sejak={cx.get('days_since_cross')}"
+                        )
             news = ctx.get("news_intel") or {}
-            if news.get("headlines") or news.get("verify_search_url"):
+            if news.get("headlines") or news.get("verify_search_url") or news.get("sectors_news_url"):
                 with st.expander(
                     f"Berita / web intel ({news.get('headline_count', 0)}) · tone={news.get('tone_hint', '?')}"
                 + (f" · {news.get('fetched_at')}" if news.get("fetched_at") else ""),
@@ -983,6 +1035,21 @@ with tab_ai:
                     vurl = news.get("verify_search_url")
                     if vurl:
                         st.markdown(f"[Cari semua berita terkait di Google News]({vurl})")
+                    surl = news.get("sectors_news_url")
+                    if surl:
+                        st.markdown(f"[Berita Sectors (filter emiten)]({surl})")
+                    fund_ctx = ctx.get("fundamental") or {}
+                    curl = fund_ctx.get("sectors_company_url")
+                    if curl:
+                        st.markdown(
+                            f"[Profil/fundamental Sectors (verifikasi manual)]({curl})"
+                        )
+                    conf = fund_ctx.get("confidence")
+                    src = fund_ctx.get("source")
+                    if conf or src:
+                        st.caption(
+                            f"Fundamental confidence: {conf or 'n/a'} ({src or '?'})"
+                        )
                     for h in news.get("headlines") or []:
                         title = h.get("title") or "-"
                         pub = h.get("publisher") or h.get("source") or ""
