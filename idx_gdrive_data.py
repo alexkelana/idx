@@ -249,3 +249,28 @@ def get_ticker_universe(fallback: list[str] | None = None) -> list[str]:
 
 def clear_cache() -> None:
     _CACHE.clear()
+
+
+def resolve_screener_universe(fallback_fn=None) -> list:
+    """
+    Prioritas daftar saham untuk semua screener:
+      1) Google Drive / URL (secrets: ticker_universe_url / liquidity_list_url)
+      2) fallback_fn() jika diberikan (mis. liquidity scanner)
+      3) list kosong
+    """
+    try:
+        remote = get_ticker_universe(fallback=[])
+        if remote:
+            print(f"[universe] Google Drive: {len(remote)} ticker")
+            return list(remote)
+    except Exception as e:
+        print(f"[universe] GDrive skip: {e}")
+    if callable(fallback_fn):
+        try:
+            fb = fallback_fn()
+            if fb:
+                print(f"[universe] fallback: {len(fb)} ticker")
+                return list(fb)
+        except Exception as e:
+            print(f"[universe] fallback error: {e}")
+    return []

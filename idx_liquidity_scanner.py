@@ -195,9 +195,23 @@ class IdxLiquidityScanner:
     # ------------------------------------------------------------------
     def get_liquid_universe(self) -> list[str]:
         """
-        Menjalankan scanning multi-threading.
-        Mengembalikan list ticker yang lolos filter likuiditas.
+        Prioritas:
+          1) Daftar saham dari Google Drive (secrets ticker_universe_url)
+          2) Scanning multi-threading likuiditas (perilaku lama)
         """
+        try:
+            from idx_gdrive_data import get_ticker_universe
+
+            remote = get_ticker_universe(fallback=[])
+            if remote:
+                print(
+                    f"\n[universe] Memakai daftar Google Drive: {len(remote)} ticker "
+                    "(skip scan likuiditas penuh)."
+                )
+                return list(remote)
+        except Exception as e:
+            print(f"[universe] GDrive tidak dipakai: {e}")
+
         self._fetch_all_idx_tickers()
 
         if not self.raw_tickers:
