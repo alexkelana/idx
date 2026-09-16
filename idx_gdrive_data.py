@@ -264,24 +264,29 @@ def clear_cache() -> None:
 
 def resolve_screener_universe(fallback_fn=None) -> list:
     """
-    Prioritas daftar saham untuk semua screener:
-      1) Google Drive / URL (secrets: ticker_universe_url / liquidity_list_url)
-      2) fallback_fn() jika diberikan (mis. liquidity scanner)
-      3) list kosong
+    Universe final untuk screener.
+
+    Google Drive hanya mengisi *kandidat* di dalam IdxLiquidityScanner
+    (menggantikan hardcode), lalu tetap difilter likuiditas.
+
+    Jika fallback_fn diberikan (biasanya scanner.get_liquid_universe),
+    panggil itu — jangan return daftar Drive mentah.
     """
-    try:
-        remote = get_ticker_universe(fallback=[])
-        if remote:
-            print(f"[universe] Google Drive: {len(remote)} ticker")
-            return list(remote)
-    except Exception as e:
-        print(f"[universe] GDrive skip: {e}")
     if callable(fallback_fn):
         try:
             fb = fallback_fn()
             if fb:
-                print(f"[universe] fallback: {len(fb)} ticker")
+                print(f"[universe] liquid: {len(fb)} ticker")
                 return list(fb)
         except Exception as e:
-            print(f"[universe] fallback error: {e}")
+            print(f"[universe] scanner error: {e}")
+        return []
+    # Tanpa scanner: Drive mentah (hanya debug / kasus khusus)
+    try:
+        remote = get_ticker_universe(fallback=[])
+        if remote:
+            print(f"[universe] Google Drive mentah (tanpa filter likuiditas): {len(remote)}")
+            return list(remote)
+    except Exception as e:
+        print(f"[universe] GDrive skip: {e}")
     return []

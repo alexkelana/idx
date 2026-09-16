@@ -48,8 +48,34 @@ class IdxLiquidityScanner:
     # 1. Ambil daftar emiten
     # ------------------------------------------------------------------
     def _fetch_all_idx_tickers(self):
-        """Mengambil daftar emiten IDX dari file Excel lokal (prioritas) atau fallback."""
-        print("1. Mengambil daftar seluruh emiten IDX...")
+        """
+        Sumber daftar kandidat (belum difilter likuiditas):
+          1) Google Drive ticker_universe_url (menggantikan hardcode / excel)
+          2) File Excel lokal "Daftar Saham*.xlsx"
+          3) Fallback kecil hardcode
+        """
+        print("1. Mengambil daftar kandidat emiten IDX...")
+
+        # --- 1) Google Drive (ganti hardcode) ---
+        try:
+            from idx_gdrive_data import get_ticker_universe
+
+            remote = get_ticker_universe(fallback=[])
+            if remote:
+                cleaned = []
+                for t in remote:
+                    t = str(t).upper().strip().replace(".JK", "")
+                    if t and t not in cleaned:
+                        cleaned.append(t)
+                if cleaned:
+                    self.raw_tickers = cleaned
+                    print(
+                        f"   Kandidat dari Google Drive: {len(self.raw_tickers)} ticker "
+                        "(akan difilter likuiditas)."
+                    )
+                    return
+        except Exception as e:
+            print(f"   Google Drive skip: {e}")
 
         # [FIX] Cari file Excel di beberapa lokasi umum
         search_dirs = [
@@ -195,23 +221,9 @@ class IdxLiquidityScanner:
     # ------------------------------------------------------------------
     def get_liquid_universe(self) -> list[str]:
         """
-        Prioritas:
-          1) Daftar saham dari Google Drive (secrets ticker_universe_url)
-          2) Scanning multi-threading likuiditas (perilaku lama)
+        1) Ambil kandidat (Google Drive → Excel → hardcode)
+        2) Filter likuiditas (min avg value & volume) — selalu dijalankan
         """
-        try:
-            from idx_gdrive_data import get_ticker_universe
-
-            remote = get_ticker_universe(fallback=[])
-            if remote:
-                print(
-                    f"\n[universe] Memakai daftar Google Drive: {len(remote)} ticker "
-                    "(skip scan likuiditas penuh)."
-                )
-                return list(remote)
-        except Exception as e:
-            print(f"[universe] GDrive tidak dipakai: {e}")
-
         self._fetch_all_idx_tickers()
 
         if not self.raw_tickers:
