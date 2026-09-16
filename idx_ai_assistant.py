@@ -507,34 +507,43 @@ def _sectors_urls(ticker: str) -> dict[str, str]:
 
 def _load_fundamentals_override(ticker: str) -> dict[str, Any] | None:
     """
-    Baca fundamentals_override.csv (prioritas tertinggi).
-    Kolom yang dikenali (case-insensitive):
-      Ticker, PE, PB, EPS, ROE, MarketCap, Sector, Industry, Name,
-      DividendYield, DebtToEquity, ProfitMargin, AsOf, Source, Notes
-    File dicari di working dir, folder skrip, dan artifacts.
+    Baca fundamentals override (prioritas: Google Drive URL di secrets, lalu file lokal).
+    Kolom: Ticker, PE, PB, EPS, ROE, MarketCap, Sector, Industry, Name,
+           DividendYield, DebtToEquity, ProfitMargin, AsOf, Source, Notes
     """
     t = str(ticker).upper().strip().replace(".JK", "")
-    candidates: list[str] = []
-    for d in _search_dirs():
-        candidates.append(os.path.join(d, "fundamentals_override.csv"))
-    try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        candidates.insert(0, os.path.join(here, "fundamentals_override.csv"))
-    except Exception:
-        pass
 
-    path = next((p for p in candidates if os.path.isfile(p)), None)
-    if not path:
-        return None
-
+    df = None
+    source_label = "none"
     try:
-        df = pd.read_csv(path, index_col=False)
+        from idx_gdrive_data import load_fundamentals_override_df
+
+        df, source_label = load_fundamentals_override_df()
     except Exception:
-        return None
+        df = None
+
+    if df is None or df.empty:
+        # fallback lokal murni (tanpa modul gdrive)
+        candidates: list[str] = []
+        for d in _search_dirs():
+            candidates.append(os.path.join(d, "fundamentals_override.csv"))
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+            candidates.insert(0, os.path.join(here, "fundamentals_override.csv"))
+        except Exception:
+            pass
+        path = next((p for p in candidates if os.path.isfile(p)), None)
+        if not path:
+            return None
+        try:
+            df = pd.read_csv(path, index_col=False)
+            source_label = f"local:{path}"
+        except Exception:
+            return None
+
     if df is None or df.empty:
         return None
     df.columns = [str(c).strip() for c in df.columns]
-    # restore jika Ticker ikut jadi index
     if "Ticker" not in df.columns and "ticker" not in [c.lower() for c in df.columns]:
         df = df.reset_index()
         df.columns = [str(c).strip() for c in df.columns]
@@ -567,12 +576,17 @@ def _load_fundamentals_override(ticker: str) -> dict[str, Any] | None:
     pm = _safe_float(_cell(row, "profitmargin", "profit_margin", "profit_margin_pct"))
     urls = _sectors_urls(t)
     src = str(_cell(row, "source") or "fundamentals_override").strip()
+    conf_note = (
+        f"Override dari {source_label}."
+        if source_label.startswith("gdrive")
+        else "Data dari fundamentals_override.csv (kurasi manual)."
+    )
     out: dict[str, Any] = {
         "ticker": t,
         "available": True,
-        "source": src,
+        "source": src if not source_label.startswith("gdrive") else f"{src}|gdrive",
         "confidence": "high",
-        "confidence_note": "Data dari fundamentals_override.csv (kurasi manual).",
+        "confidence_note": conf_note,
         "name": _cell(row, "name", "company_name"),
         "sector": _cell(row, "sector"),
         "industry": _cell(row, "industry"),
@@ -588,9 +602,9 @@ def _load_fundamentals_override(ticker: str) -> dict[str, Any] | None:
         "as_of": _cell(row, "asof", "as_of", "date"),
         "notes": _cell(row, "notes", "note"),
         "valuation_note": _classify_valuation(pe, pb),
-        "override_file": path,
+        "override_file": source_label,
         **urls,
-        "disclaimer": "Override manual — pastikan AsOf dan angka sesuai laporan terkini.",
+        "disclaimer": "Override manual/Drive — pastikan AsOf dan angka sesuai laporan terkini.",
     }
     return out
 
