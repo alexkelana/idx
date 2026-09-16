@@ -205,8 +205,9 @@ def load_fundamentals_override_df() -> tuple[pd.DataFrame | None, str]:
 def load_ticker_list_from_url(url: str | None = None) -> list[str]:
     """
     Baca daftar ticker dari CSV Drive/URL.
-    Kolom yang dikenali: Ticker / Symbol / Code (case-insensitive).
-    Atau file satu kolom tanpa header.
+    Kolom yang dikenali (case-insensitive):
+      Ticker, Symbol, Code, Kode, Emiten, Saham
+    Jika tidak ketemu → pakai kolom pertama.
     """
     url = url or _secrets_get("ticker_universe_url") or _secrets_get("liquidity_list_url")
     if not url:
@@ -218,7 +219,14 @@ def load_ticker_list_from_url(url: str | None = None) -> list[str]:
 
     df.columns = [str(c).strip() for c in df.columns]
     colmap = {c.lower(): c for c in df.columns}
-    tcol = colmap.get("ticker") or colmap.get("symbol") or colmap.get("code") or colmap.get("emiten")
+    tcol = (
+        colmap.get("ticker")
+        or colmap.get("symbol")
+        or colmap.get("code")
+        or colmap.get("kode")  # format lama IDX
+        or colmap.get("emiten")
+        or colmap.get("saham")
+    )
     if tcol:
         series = df[tcol]
     else:
@@ -226,9 +234,12 @@ def load_ticker_list_from_url(url: str | None = None) -> list[str]:
 
     out: list[str] = []
     seen: set[str] = set()
+    skip_headers = {
+        "TICKER", "SYMBOL", "CODE", "KODE", "EMITEN", "SAHAM", "NAN", "NONE",
+    }
     for v in series.astype(str):
         t = v.strip().upper().replace(".JK", "")
-        if not t or t in ("TICKER", "SYMBOL", "CODE", "NAN", "NONE"):
+        if not t or t in skip_headers:
             continue
         if t not in seen:
             seen.add(t)
