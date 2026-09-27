@@ -144,13 +144,67 @@ REPORT_VERSIONS = [
 ]
 
 # =====================================================================
+# REGIME IHSG — cache + staleness helpers
+#
+# BUG SEBELUMNYA: st.session_state["ihsg_regime"] hanya di-refresh saat
+# tombol "Cek Rezim Sekarang" (Tab Kondisi Pasar) atau mode "AI Adaptive"
+# (Tab Screener) dijalankan. Tab "AI Assistant" cuma MEMBACA cache ini
+# tanpa pernah refresh sendiri -> semua ticker yang dianalisa berturut-turut
+# di Tab AI Assistant memakai regime yang SAMA PERSIS meski sudah basi
+# berjam-jam. Helper di bawah menambal itu: setiap regime disimpan
+# dengan timestamp, dan Tab AI Assistant auto-refresh kalau sudah > TTL.
+# =====================================================================
+IHSG_REGIME_TTL_SECONDS = 900  # 15 menit — di atas ini dianggap basi
+
+
+def _set_ihsg_regime(regime: dict) -> None:
+    """Simpan hasil rezim IHSG ke session_state, dibubuhi timestamp (JSON-safe)."""
+    regime = dict(regime or {})
+    now = datetime.now()
+    regime["fetched_at_epoch"] = now.timestamp()
+    regime["fetched_at_str"] = now.strftime("%d/%m/%Y %H:%M:%S")
+    st.session_state["ihsg_regime"] = regime
+
+
+def _ihsg_regime_age_seconds():
+    """Umur data regime saat ini dalam detik, atau None kalau belum pernah diambil."""
+    reg = st.session_state.get("ihsg_regime") or {}
+    ts = reg.get("fetched_at_epoch")
+    if not ts:
+        return None
+    return datetime.now().timestamp() - ts
+
+
+def _ihsg_regime_is_stale(ttl: int = IHSG_REGIME_TTL_SECONDS) -> bool:
+    age = _ihsg_regime_age_seconds()
+    return age is None or age > ttl
+
+
+def _refresh_ihsg_regime() -> dict:
+    """Ambil ulang rezim IHSG langsung (live) dari master_screener_ai dan cache dengan timestamp baru."""
+    try:
+        import master_screener_ai
+
+        regime = master_screener_ai.analyze_ihsg_regime()
+    except Exception as e:
+        regime = {
+            "regime": "UNKNOWN",
+            "reason": [f"Gagal ambil rezim: {e}"],
+            "strategies": [],
+            "last_close": None,
+        }
+    _set_ihsg_regime(regime)
+    return st.session_state["ihsg_regime"]
+
+
+# =====================================================================
 # SIDEBAR
 # =====================================================================
 st.sidebar.header("⚙️ Modal & Risiko")
 account_size = st.sidebar.number_input(
     "Total Modal (Rp)",
     min_value=1_000_000,
-    value=50_000_000,
+    value=4_000_000,
     step=1_000_000,
     format="%d",
 )
@@ -432,17 +486,7 @@ with tab_pasar:
 
     if cek_rezim:
         with st.spinner("Mengambil data IHSG..."):
-            try:
-                import master_screener_ai
-
-                st.session_state["ihsg_regime"] = master_screener_ai.analyze_ihsg_regime()
-            except Exception as e:
-                st.session_state["ihsg_regime"] = {
-                    "regime": "UNKNOWN",
-                    "reason": [str(e)],
-                    "strategies": [],
-                    "last_close": None,
-                }
+            _refresh_ihsg_regime()
 
     if "ihsg_regime" not in st.session_state:
         st.session_state["ihsg_regime"] = {
@@ -528,6 +572,20 @@ with tab_pasar:
         st.markdown(f"- {r}")
     if reg.get("strategies"):
         st.markdown(f"**Strategi disarankan:** `{', '.join(reg['strategies'])}`")
+
+    if str(regime) not in ("Belum dicek", "UNKNOWN", ""):
+        age = _ihsg_regime_age_seconds()
+        if age is not None:
+            mins = age / 60
+            if _ihsg_regime_is_stale():
+                st.warning(
+                    f"⏱️ Data rezim ini diambil **{reg.get('fetched_at_str', '?')}** "
+                    f"(±{mins:.0f} menit lalu) — sudah lewat batas segar "
+                    f"{IHSG_REGIME_TTL_SECONDS // 60} menit. Klik **Cek Rezim Sekarang** "
+                    "untuk data terbaru sebelum dipakai analisa ticker."
+                )
+            else:
+                st.caption(f"⏱️ Diambil {reg.get('fetched_at_str', '?')} (±{mins:.0f} menit lalu).")
 
     st.markdown("---")
     st.markdown("##### 📰 Berita pasar (near real-time)")
@@ -719,11 +777,7 @@ with tab_screener:
                     run_ai, account_size, risk_pct, broker_buy, broker_sell
                 )
                 try:
-                    import master_screener_ai
-
-                    st.session_state["ihsg_regime"] = (
-                        master_screener_ai.analyze_ihsg_regime()
-                    )
+                    _refresh_ihsg_regime()
                 except Exception:
                     pass
             elif mode.startswith("V2"):
@@ -925,6 +979,13 @@ with tab_ai:
             help="Contoh: gpt-4o-mini, grok-2-latest",
         )
 
+        auto_save_txt = st.checkbox(
+            "Simpan otomatis ke file .txt setelah analisa",
+            value=True,
+            key="ai_auto_save_txt",
+            help="Menyimpan ke folder ai_analysis_output/ di server (lokal/Cloud).",
+        )
+
         run_ai_btn = st.button(
             "🧠 Analisa dengan AI",
             type="primary",
@@ -934,6 +995,17 @@ with tab_ai:
         )
 
         if run_ai_btn and selected_tickers:
+            # FIX: dulu regime IHSG di sini hanya dibaca dari cache tanpa pernah
+            # di-refresh sendiri, sehingga semua ticker dalam satu batch (bahkan
+            # batch yang dijalankan berjam-jam setelah cache terakhir diisi)
+            # memakai regime yang SAMA PERSIS dan bisa basi. Sekarang: kalau
+            # cache kosong/lebih tua dari TTL, refresh dulu sebelum loop ticker.
+            if _ihsg_regime_is_stale():
+                with st.spinner(
+                    "Rezim IHSG belum ada / sudah basi — mengambil ulang sebelum analisa..."
+                ):
+                    _refresh_ihsg_regime()
+
             regime_ctx = st.session_state.get("ihsg_regime") or {}
             regime_slim = {
                 k: regime_ctx.get(k)
@@ -950,11 +1022,21 @@ with tab_ai:
                     "vol_ratio_20",
                     "range_5_pct",
                     "range_20_pct",
+                    "fetched_at_epoch",
+                    "fetched_at_str",
                 )
                 if k in regime_ctx
             }
+            if regime_slim.get("fetched_at_str"):
+                st.caption(
+                    f"🕒 Regime IHSG untuk batch analisa ini diambil pukul "
+                    f"**{regime_slim['fetched_at_str']}** — dipakai sama untuk "
+                    f"semua ticker: {', '.join(selected_tickers)}."
+                )
             results_ai = []
-            with st.spinner(f"Menjalankan agent untuk {', '.join(selected_tickers)}..."):
+            with st.spinner(
+                f"Menjalankan agent untuk {', '.join(selected_tickers)}..."
+            ):
                 for t in selected_tickers:
                     try:
                         out = ai_asst.analyze_ticker(
@@ -967,17 +1049,38 @@ with tab_ai:
                             broker_sell_pct=float(broker_sell),
                             model=ai_model.strip() or None,
                         )
-                        results_ai.append(out)
                     except Exception as e:
-                        results_ai.append(
-                            {
-                                "ticker": t,
-                                "version": ai_version,
-                                "error": str(e),
-                                "analyses": {},
-                            }
-                        )
+                        out = {
+                            "ticker": t,
+                            "version": ai_version,
+                            "error": str(e),
+                            "analyses": {},
+                        }
+                    if auto_save_txt and (
+                        out.get("analyses") or out.get("error")
+                    ):
+                        try:
+                            txt_path = ai_asst.save_analysis_to_txt(out)
+                            out["saved_txt_path"] = txt_path
+                            try:
+                                with open(txt_path, "rb") as fh:
+                                    out["saved_txt_bytes"] = fh.read()
+                            except Exception:
+                                out["saved_txt_bytes"] = None
+                        except Exception as se:
+                            out["saved_txt_error"] = str(se)
+                    results_ai.append(out)
             st.session_state["ai_assistant_results"] = results_ai
+            saved_ok = [
+                r.get("saved_txt_path")
+                for r in results_ai
+                if r.get("saved_txt_path")
+            ]
+            if saved_ok:
+                st.success(
+                    "Analisa disimpan ke .txt:\n"
+                    + "\n".join(f"- `{p}`" for p in saved_ok)
+                )
 
         for out in st.session_state.get("ai_assistant_results") or []:
             t = out.get("ticker", "?")
@@ -997,6 +1100,44 @@ with tab_ai:
                     with st.expander("Detail error per role", expanded=False):
                         for rk, rv in err_map.items():
                             st.text(f"{rk}: {rv}")
+
+            # Tombol unduh / simpan ulang TXT
+            c_dl1, c_dl2 = st.columns([1, 1])
+            with c_dl1:
+                if out.get("saved_txt_bytes"):
+                    fname = (
+                        f"{t}_{out.get('version', 'na')}_"
+                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                    )
+                    st.download_button(
+                        label=f"⬇️ Unduh analisa {t} (.txt)",
+                        data=out["saved_txt_bytes"],
+                        file_name=fname,
+                        mime="text/plain",
+                        key=f"ai_dl_{t}_{out.get('generated_at', '')}",
+                    )
+                elif out.get("analyses"):
+                    # generate on the fly if belum auto-save
+                    try:
+                        _p = ai_asst.save_analysis_to_txt(out)
+                        with open(_p, "rb") as _f:
+                            _b = _f.read()
+                        st.download_button(
+                            label=f"⬇️ Unduh analisa {t} (.txt)",
+                            data=_b,
+                            file_name=f"{t}_{out.get('version', 'na')}.txt",
+                            mime="text/plain",
+                            key=f"ai_dl_live_{t}_{out.get('generated_at', id(out))}",
+                        )
+                        out["saved_txt_path"] = _p
+                    except Exception as se:
+                        st.caption(f"Gagal siapkan unduhan: {se}")
+            with c_dl2:
+                if out.get("saved_txt_path"):
+                    st.caption(f"Server: `{out['saved_txt_path']}`")
+                if out.get("saved_txt_error"):
+                    st.caption(f"Gagal simpan: {out['saved_txt_error']}")
+
             analyses = out.get("analyses") or {}
             if analyses.get("chief"):
                 st.markdown("**Chief (ringkasan)**")

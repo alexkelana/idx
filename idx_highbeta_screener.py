@@ -10,15 +10,17 @@ Untuk saham berkarakter mirip BUMI:
 Cocok: diskresi intraday ~ swing sangat pendek
 Tidak cocok: investor yang ingin setup tenang & RR struktural murni
 
+[Update] run_highbeta_screener(..., universe=) — pakai shared cache dari confluence/master.
 Disclaimer: alat bantu screening, bukan rekomendasi.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from datetime import datetime
 
 try:
     from idx_liquidity_scanner import IdxLiquidityScanner
@@ -26,28 +28,24 @@ except ImportError:
     IdxLiquidityScanner = None
 
 PARAMS = {
-    # Likuiditas — lebih ketat dari V2 (karakter "board aktif")
-    "min_avg_value_rp": 30_000_000_000,   # 30M+/hari
+    "min_avg_value_rp": 30_000_000_000,
     "min_avg_volume": 5_000_000,
     "lookback_days": 60,
-    # Karakter high-beta
-    "min_range_20_pct": 10.0,             # range 20D minimal (bukan max)
-    "max_range_20_pct": 45.0,             # buang yang terlalu gila / data aneh
-    "min_atr_pct": 2.5,                   # ATR/Close minimal
+    "min_range_20_pct": 10.0,
+    "max_range_20_pct": 45.0,
+    "min_atr_pct": 2.5,
     "max_atr_pct": 12.0,
-    "min_vol_ratio": 1.15,                # 5d vs 20d
+    "min_vol_ratio": 1.15,
     "min_price": 100,
     "max_price": 5000,
-    # Momentum mikro (longgar)
     "rsi_min": 35,
     "rsi_max": 75,
-    "require_above_ma10": False,          # True = hanya yang masih panas short-term
-    # Risk — size kecil, SL ATR
+    "require_above_ma10": False,
     "sl_atr_mult": 1.2,
     "tp_atr_mult": 1.8,
     "min_rr": 1.3,
     "account_size": 4_000_000,
-    "risk_per_trade_pct": 0.5,            # lebih kecil: saham liar
+    "risk_per_trade_pct": 0.5,
     "lot_size": 100,
     "top_n": 20,
     "min_score": 50,
@@ -106,6 +104,7 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
             progress=False,
             auto_adjust=True,
             multi_level_index=False,
+            threads=False,
         )
     except Exception:
         return None
@@ -159,11 +158,9 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     if params.get("require_above_ma10") and last < ma10:
         return None
 
-    # Skor karakter spekulatif likuid
     score = 0
     reasons = []
 
-    # Value tier
     if avg_val >= 100e9:
         score += 25
         reasons.append(f"Value sangat besar ({avg_val/1e9:.0f}M)")
@@ -174,7 +171,6 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         score += 10
         reasons.append(f"Value OK ({avg_val/1e9:.0f}M)")
 
-    # Volatilitas di zona "aktif tapi masih tradeable"
     if 12 <= range20 <= 28:
         score += 20
         reasons.append(f"Range20 spekulatif ({range20:.0f}%)")
@@ -203,7 +199,6 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         score += 8
         reasons.append("Di atas MA20")
 
-    # Kedekatan high20 — momentum pendek (boleh tidak di puncak)
     dist_high = (high20 - last) / last * 100
     if dist_high <= 5:
         score += 10
@@ -220,7 +215,6 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     if score < params["min_score"]:
         return None
 
-    # Plan agresif pendek — SL/TP berbasis ATR (bukan struktur SMC)
     entry = round_to_idx_tick(last)
     stop_raw = entry - params["sl_atr_mult"] * atr
     stop = apply_ara_arb_limits(round_to_idx_tick(stop_raw), last, is_target=False)
@@ -232,7 +226,6 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         return None
 
     target_raw = entry + params["tp_atr_mult"] * atr
-    # jangan jauh di atas high20 tanpa alasan
     target_raw = min(target_raw, high20 * 1.02 if high20 > entry else target_raw)
     target = apply_ara_arb_limits(round_to_idx_tick(target_raw), last, is_target=True)
 
@@ -270,13 +263,13 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
 
 
 def get_universe(params: dict) -> list:
-    # Prefilter longgar; filter ketat value di analyse
     if IdxLiquidityScanner is None:
         return [
             "BUMI", "BREN", "GOTO", "BBCA", "BBRI", "BMRI", "TLKM", "ASII",
             "AMMN", "MDKA", "ANTM", "ADRO", "PTBA", "ITMG", "BRMS", "CUAN",
             "DSSA", "BYAN", "EMTK", "BUKA", "ARTO", "PANI", "TPIA", "BRPT",
         ]
+    # Prefilter longgar; filter value ketat di analyze_ticker
     scanner = IdxLiquidityScanner(
         min_avg_value_rp=max(15_000_000_000, params["min_avg_value_rp"] * 0.5),
         min_avg_volume=max(2_000_000, int(params["min_avg_volume"] * 0.4)),
@@ -286,7 +279,11 @@ def get_universe(params: dict) -> list:
     return scanner.get_liquid_universe()
 
 
-def run_highbeta_screener(user_params: dict | None = None):
+def run_highbeta_screener(user_params: dict | None = None, universe=None):
+    """
+    universe: opsional dari confluence/master (cache).
+    Filter high-beta tetap di analyze_ticker (value/ATR/range).
+    """
     params = PARAMS.copy()
     if user_params:
         params.update(user_params)
@@ -294,7 +291,11 @@ def run_highbeta_screener(user_params: dict | None = None):
     print("=" * 60)
     print("HIGH-BETA / SPECULATIVE LIQUID SCREENER")
     print("=" * 60)
-    universe = get_universe(params)
+    if universe:
+        print(f"Memakai shared universe ({len(universe)} ticker) — skip scan HB.")
+        universe = [str(t).upper().replace(".JK", "").strip() for t in universe]
+    else:
+        universe = get_universe(params)
     print(f"Analisa {len(universe)} kandidat...\n")
 
     rows = []
@@ -332,6 +333,7 @@ def run_highbeta_screener(user_params: dict | None = None):
 
     try:
         from idx_report_schema import save_version_report
+
         path = save_version_report(df, "highbeta")
     except Exception:
         path = f"idx_report_highbeta_{datetime.now().strftime('%Y-%m-%d')}.csv"

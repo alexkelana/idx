@@ -6,18 +6,31 @@ IDX LIQUIDITY SCANNER — Fixed Version
 - Hapus duplikat fallback ticker
 - dropna + guard data lebih ketat
 - Cari file Excel di beberapa lokasi
-- Optional simple in-memory cache
+- Optional simple in-memory cache per-ticker
+- Cache universe penuh antar strategi (satu proses)
 - Progress print lebih aman
 - Timeout / exception handling lebih bersih
 """
 
+from __future__ import annotations
+
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
 import pandas as pd
 import yfinance as yf
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
-import time
-from pathlib import Path
+
+# Cache universe penuh antar strategi (satu proses = scan likuiditas sekali)
+# key -> (timestamp, list[ticker])
+_UNIVERSE_CACHE: dict = {}
+_UNIVERSE_CACHE_TTL_SEC = 45 * 60  # 45 menit
+
+
+def clear_universe_cache() -> None:
+    """Hapus cache daftar likuiditas global (paksa scan ulang)."""
+    _UNIVERSE_CACHE.clear()
+
 
 class IdxLiquidityScanner:
     def __init__(
@@ -40,8 +53,8 @@ class IdxLiquidityScanner:
         self.raw_tickers: list[str] = []
         self.liquid_tickers: list[str] = []
 
-        # [FIX] Simple in-memory cache (berlaku selama proses Python hidup)
-        # Key: (ticker, lookback, min_value, min_vol) → hasil True/False
+        # Cache per-ticker (berlaku selama proses Python hidup)
+        # Key: (ticker, lookback, min_value, min_vol) → True/False
         self._cache: dict = {}
 
     # ------------------------------------------------------------------
@@ -77,7 +90,7 @@ class IdxLiquidityScanner:
         except Exception as e:
             print(f"   Google Drive skip: {e}")
 
-        # [FIX] Cari file Excel di beberapa lokasi umum
+        # --- 2) File Excel lokal ---
         search_dirs = [
             Path("."),
             Path(__file__).parent if "__file__" in globals() else Path("."),
@@ -93,7 +106,9 @@ class IdxLiquidityScanner:
             try:
                 for file in directory.iterdir():
                     name = file.name
-                    if name.startswith("Daftar Saham") and name.lower().endswith((".xlsx", ".xls")):
+                    if name.startswith("Daftar Saham") and name.lower().endswith(
+                        (".xlsx", ".xls")
+                    ):
                         excel_file = file
                         break
             except Exception:
@@ -106,7 +121,6 @@ class IdxLiquidityScanner:
                 print(f"   Membaca data dari file lokal: {excel_file}")
                 df = pd.read_excel(excel_file)
 
-                # Cari kolom 'Kode' (case-insensitive)
                 kode_col = None
                 for col in df.columns:
                     if str(col).strip().lower() in ("kode", "code", "ticker", "symbol"):
@@ -118,20 +132,20 @@ class IdxLiquidityScanner:
                     cleaned = []
                     for t in tickers:
                         t = t.upper().strip()
-                        # Terima 3–4 huruf (beberapa emiten lama 3 huruf)
                         if 3 <= len(t) <= 4 and t.isalpha():
                             cleaned.append(t)
 
                     self.raw_tickers = sorted(set(cleaned))
                     if len(self.raw_tickers) > 50:
-                        print(f"   Berhasil memuat {len(self.raw_tickers)} emiten dari file Excel.")
+                        print(
+                            f"   Berhasil memuat {len(self.raw_tickers)} emiten dari file Excel."
+                        )
                         return
-                    else:
-                        print("   Jumlah ticker dari Excel terlalu sedikit, pakai fallback.")
+                    print("   Jumlah ticker dari Excel terlalu sedikit, pakai fallback.")
             except Exception as e:
                 print(f"   Gagal membaca file Excel: {e}")
 
-        # [FIX] Fallback statis — sudah di-unique & diurutkan
+        # --- 3) Fallback ---
         print("   File Excel tidak ditemukan / gagal. Menggunakan daftar fallback (unique).")
         fallback = [
             "BBCA", "BBRI", "BMRI", "BBNI", "BRIS", "ARTO", "TLKM", "EXCL", "ISAT", "MTEL",
@@ -153,14 +167,17 @@ class IdxLiquidityScanner:
     # ------------------------------------------------------------------
     def _check_liquidity(self, ticker: str):
         """Worker: cek apakah satu saham memenuhi syarat likuiditas."""
-        # [FIX] Cache key
-        cache_key = (ticker, self.lookback_days, self.min_avg_value_rp, self.min_avg_volume)
+        cache_key = (
+            ticker,
+            self.lookback_days,
+            self.min_avg_value_rp,
+            self.min_avg_volume,
+        )
         if self.use_cache and cache_key in self._cache:
             return ticker if self._cache[cache_key] else None
 
         symbol = f"{ticker}.JK"
         try:
-            # [FIX] Gunakan period + auto_adjust + multi_level_index=False
             df = yf.download(
                 symbol,
                 period=f"{int(self.lookback_days * 1.8)}d",
@@ -175,7 +192,6 @@ class IdxLiquidityScanner:
                 self._cache[cache_key] = False
                 return None
 
-            # [FIX] MultiIndex fallback (jika parameter diabaikan yfinance)
             if isinstance(df.columns, pd.MultiIndex):
                 try:
                     df.columns = df.columns.get_level_values(0)
@@ -190,7 +206,6 @@ class IdxLiquidityScanner:
                 self._cache[cache_key] = False
                 return None
 
-            # [FIX] Drop NaN lalu ambil lookback
             df = df[["Close", "Volume"]].dropna()
             if len(df) < max(10, self.lookback_days - 8):
                 self._cache[cache_key] = False
@@ -202,12 +217,13 @@ class IdxLiquidityScanner:
             daily_value = df["Close"] * df["Volume"]
             avg_value = daily_value.mean()
 
-            # Hindari NaN
             if pd.isna(avg_volume) or pd.isna(avg_value):
                 self._cache[cache_key] = False
                 return None
 
-            is_liquid = (avg_volume >= self.min_avg_volume) and (avg_value >= self.min_avg_value_rp)
+            is_liquid = (avg_volume >= self.min_avg_volume) and (
+                avg_value >= self.min_avg_value_rp
+            )
             self._cache[cache_key] = is_liquid
 
             return ticker if is_liquid else None
@@ -219,11 +235,29 @@ class IdxLiquidityScanner:
     # ------------------------------------------------------------------
     # 3. Main entry
     # ------------------------------------------------------------------
-    def get_liquid_universe(self) -> list[str]:
+    def get_liquid_universe(self, force_refresh: bool = False) -> list[str]:
         """
         1) Ambil kandidat (Google Drive → Excel → hardcode)
-        2) Filter likuiditas (min avg value & volume) — selalu dijalankan
+        2) Filter likuiditas (min avg value & volume)
+
+        Hasil universe di-cache per proses (TTL) agar master/confluence
+        yang menjalankan banyak strategi tidak scan berulang.
         """
+        cache_key = (
+            float(self.min_avg_value_rp),
+            float(self.min_avg_volume),
+            int(self.lookback_days),
+        )
+        if not force_refresh and cache_key in _UNIVERSE_CACHE:
+            ts, cached = _UNIVERSE_CACHE[cache_key]
+            if (time.time() - ts) < _UNIVERSE_CACHE_TTL_SEC and cached:
+                print(
+                    f"\n[universe-cache] Memakai cache likuiditas: "
+                    f"{len(cached)} ticker (umur {(time.time() - ts) / 60:.1f} mnt)."
+                )
+                self.liquid_tickers = list(cached)
+                return list(cached)
+
         self._fetch_all_idx_tickers()
 
         if not self.raw_tickers:
@@ -232,8 +266,8 @@ class IdxLiquidityScanner:
 
         print(
             f"\n2. Memindai likuiditas {len(self.raw_tickers)} saham "
-            f"(Target: Avg Value > Rp{self.min_avg_value_rp/1e9:.0f}M & "
-            f"Avg Vol > {self.min_avg_volume/1e6:.1f}Jt)"
+            f"(Target: Avg Value > Rp{self.min_avg_value_rp / 1e9:.0f}M & "
+            f"Avg Vol > {self.min_avg_volume / 1e6:.1f}Jt)"
         )
         print(f"   Multi-threading ({self.max_workers} workers). Estimasi 1–2 menit...")
 
@@ -250,9 +284,11 @@ class IdxLiquidityScanner:
             for future in as_completed(future_to_ticker):
                 completed_count += 1
 
-                # [FIX] Progress lebih jarang & aman
                 if completed_count % 40 == 0 or completed_count == total:
-                    print(f"   Progress: {completed_count}/{total} saham diproses...", end="\r")
+                    print(
+                        f"   Progress: {completed_count}/{total} saham diproses...",
+                        end="\r",
+                    )
 
                 try:
                     result = future.result(timeout=30)
@@ -261,34 +297,48 @@ class IdxLiquidityScanner:
                 except Exception:
                     pass
 
-        print()  # baris baru setelah progress
+        print()
 
         elapsed = time.time() - start_time
         print(f"3. Selesai dalam {elapsed:.1f} detik.")
         print(f"   Ditemukan {len(valid_tickers)} saham yang sangat likuid saat ini.")
 
         self.liquid_tickers = sorted(set(valid_tickers))
-        return self.liquid_tickers
+        _UNIVERSE_CACHE[cache_key] = (time.time(), list(self.liquid_tickers))
+        return list(self.liquid_tickers)
 
     def clear_cache(self):
-        """Hapus cache manual jika diperlukan."""
+        """Hapus cache per-ticker dan cache universe global."""
         self._cache.clear()
+        clear_universe_cache()
 
 
-# ------------------------------------------------------------------
-# Testing mandiri
-# ------------------------------------------------------------------
-if __name__ == "__main__":
-    print("=== TEST IDX LIQUIDITY SCANNER (Fixed) ===")
+def get_shared_liquid_universe(
+    min_avg_value_rp: float = 10_000_000_000,
+    min_avg_volume: float = 1_000_000,
+    lookback_days: int = 20,
+    max_workers: int = 15,
+    force_refresh: bool = False,
+) -> list:
+    """
+    Ambil universe likuid dengan cache proses.
+    Dipakai master / confluence agar multi-strategi tidak scan berulang.
+    """
     scanner = IdxLiquidityScanner(
-        min_avg_value_rp=10_000_000_000,
-        min_avg_volume=1_000_000,
-        lookback_days=20,
-        max_workers=15,
+        min_avg_value_rp=min_avg_value_rp,
+        min_avg_volume=min_avg_volume,
+        lookback_days=lookback_days,
+        max_workers=max_workers,
         use_cache=True,
     )
-    liquid_stocks = scanner.get_liquid_universe()
+    if force_refresh:
+        clear_universe_cache()
+    return scanner.get_liquid_universe(force_refresh=force_refresh)
 
+
+if __name__ == "__main__":
+    print("=== TEST IDX LIQUIDITY SCANNER ===")
+    stocks = get_shared_liquid_universe()
     print("\nDaftar Saham Likuid:")
-    print(liquid_stocks)
-    print(f"\nTotal: {len(liquid_stocks)} saham")
+    print(stocks)
+    print(f"\nTotal: {len(stocks)} saham")

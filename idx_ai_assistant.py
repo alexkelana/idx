@@ -120,94 +120,660 @@ ROLE_MAX_TOKENS = {
     "chief": 1600,
 }
 
+# =========================================================================
+# DETERMINISTIC ANALYSIS ENGINE (FACT → SIGNAL → SCORE → STANCE)
+# Berlaku untuk semua strategy screener. AI menjelaskan; engine menghitung.
+# =========================================================================
+ENGINE_PARAMS = {
+    "fib_at_level_atr": 0.10,
+    "fib_near_level_atr": 0.30,
+    "fib_away_atr": 0.75,
+    "pe_low": 10.0,
+    "pe_high": 25.0,
+    "pb_low": 1.0,
+    "pb_high": 3.0,
+    "roe_weak": 8.0,
+    "roe_strong": 20.0,
+    "rr_tp1_weight": 0.5,
+    "rr_tp2_weight": 0.5,
+    "score_tech_w": 0.45,
+    "score_fund_w": 0.20,
+    "score_risk_w": 0.18,
+    "score_market_w": 0.07,
+    "score_catalyst_w": 0.10,
+}
+
+
+def _fnum(x, default=None):
+    try:
+        if x is None or (isinstance(x, float) and x != x):
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def _row_get(row: dict, *keys, default=None):
+    for k in keys:
+        if k in row and row[k] is not None and str(row[k]).strip() != "":
+            return row[k]
+    return default
+
+
+def build_facts(context: dict) -> dict[str, Any]:
+    """Layer FACT — angka mentah, tanpa interpretasi."""
+    row = context.get("screener_row") or {}
+    ma = context.get("ma_structure") or {}
+    ma_vals = ma.get("ma") or {}
+    fund = context.get("canonical_valuation") or context.get("fundamental") or {}
+    regime = context.get("market_regime") or context.get("regime") or {}
+    acc = context.get("account") or {}
+
+    close = _fnum(_row_get(row, "Close", "Entry", default=ma.get("last_close")))
+    entry = _fnum(_row_get(row, "Entry", "Close"), close)
+    sl = _fnum(_row_get(row, "StopLoss"))
+    tp1 = _fnum(
+        _row_get(
+            row,
+            "Target1",
+            "Target1(Peak)",
+            "Target(Liquidity)",
+            "Target",
+            "Target(Peak)",
+        )
+    )
+    tp2 = _fnum(_row_get(row, "Target2(Ext)", "Target2", "Target(Ext)"))
+    atr = _fnum(_row_get(row, "ATR", "ATR14"))
+    fib382 = _fnum(_row_get(row, "Fibo382", "Fib382"))
+    fib618 = _fnum(_row_get(row, "Fibo618", "Fib618"))
+    adx = _fnum(_row_get(row, "ADX"))
+    roc = _fnum(_row_get(row, "ROC(10)", "ROC10", "ROC"))
+    score_scr = _fnum(_row_get(row, "Score"))
+    rr_scr = _fnum(_row_get(row, "RR_Ratio", "RR"))
+    lots = _fnum(_row_get(row, "Lots"), 0) or 0
+    retest_raw = _row_get(row, "RetestOK", "Retest", "Reversal")
+    alasan = str(_row_get(row, "Alasan", default="") or "")
+
+    risk_ps = None
+    if entry and sl and entry > sl:
+        risk_ps = entry - sl
+    rr_tp1 = (tp1 - entry) / risk_ps if risk_ps and tp1 and entry else rr_scr
+    rr_tp2 = (tp2 - entry) / risk_ps if risk_ps and tp2 and entry else None
+
+    acct = _fnum(acc.get("size_rp"), 50_000_000) or 50_000_000
+    risk_pct_cfg = _fnum(acc.get("risk_per_trade_pct"), 1.0) or 1.0
+    account_risk_pct = None
+    if lots and risk_ps and acct > 0:
+        account_risk_pct = (lots * 100 * risk_ps) / acct * 100
+
+    # Regime: normalize UNKNOWN if empty / missing key regime
+    reg_label = regime.get("regime") if isinstance(regime, dict) else None
+    if not reg_label or str(reg_label).upper() in ("", "NONE", "NULL"):
+        reg_label = "UNKNOWN"
+    else:
+        reg_label = str(reg_label).upper()
+
+    return {
+        "ticker": context.get("ticker"),
+        "screener_version": context.get("screener_version"),
+        "close": close,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "atr": atr,
+        "fib382": fib382,
+        "fib618": fib618,
+        "adx": adx,
+        "roc": roc,
+        "screener_score": score_scr,
+        "rr_screener": rr_scr,
+        "rr_tp1": round(rr_tp1, 2) if rr_tp1 is not None else None,
+        "rr_tp2": round(rr_tp2, 2) if rr_tp2 is not None else None,
+        "lots": lots,
+        "account_risk_pct": round(account_risk_pct, 3) if account_risk_pct is not None else None,
+        "risk_pct_cfg": risk_pct_cfg,
+        "retest_raw": retest_raw,
+        "alasan": alasan,
+        "ma20": _fnum(ma_vals.get("MA20")),
+        "ma50": _fnum(ma_vals.get("MA50")),
+        "ma100": _fnum(ma_vals.get("MA100")),
+        "ma200": _fnum(ma_vals.get("MA200")),
+        "ma_available": bool(ma.get("available")),
+        "ma_stack_hint": (ma.get("stack") or ma.get("interpretation_hints") or None),
+        "pe": _fnum(fund.get("pe_ratio")),
+        "pb": _fnum(fund.get("pb_ratio")),
+        "roe": _fnum(fund.get("roe")),
+        "div_yield": _fnum(fund.get("dividend_yield_pct")),
+        "fund_source": fund.get("source"),
+        "fund_confidence": fund.get("confidence"),
+        "ihsg_regime_raw": reg_label,
+        "ihsg_last_close": _fnum(regime.get("last_close")) if isinstance(regime, dict) else None,
+    }
+
+
+def _classify_fib_distance(close, level, atr, p=ENGINE_PARAMS) -> tuple[str | None, float | None]:
+    if close is None or level is None or not atr or atr <= 0:
+        return None, None
+    dist = abs(close - level)
+    dist_atr = dist / atr
+    if dist_atr <= p["fib_at_level_atr"]:
+        state = "AT_LEVEL"
+    elif dist_atr <= p["fib_near_level_atr"]:
+        state = "NEAR_LEVEL"
+    elif dist_atr <= p["fib_away_atr"]:
+        state = "AWAY"
+    else:
+        state = "FAR"
+    return state, round(dist_atr, 3)
+
+
+def _retest_status(facts: dict) -> str:
+    """
+    NO_RETEST | VALID_RETEST | FAILED_RETEST | UNKNOWN
+    NO_RETEST ≠ gagal; tidak ada penalti otomatis.
+    """
+    raw = facts.get("retest_raw")
+    alasan = (facts.get("alasan") or "").lower()
+    if raw is not None:
+        s = str(raw).strip().lower()
+        if s in ("ya", "yes", "true", "1", "valid", "ok"):
+            return "VALID_RETEST"
+        if s in ("tidak", "no", "false", "0", "failed", "gagal"):
+            # V3 "RetestOK=Tidak" bisa berarti belum/ gagal — bedakan via alasan
+            if any(x in alasan for x in ("gagal", "fail", "breakdown", "invalid")):
+                return "FAILED_RETEST"
+            if any(x in alasan for x in ("retest hold", "retest", "fibo golden", "fibo zone")):
+                return "VALID_RETEST"
+            return "NO_RETEST"
+    if any(x in alasan for x in ("retest hold", "retest ok", "fibo golden", "fibo zone")):
+        return "VALID_RETEST"
+    if "retest gagal" in alasan or "failed retest" in alasan:
+        return "FAILED_RETEST"
+    # V2/V4/V5 sering tanpa field retest → UNKNOWN (bukan FAILED)
+    ver = str(facts.get("screener_version") or "").lower()
+    if "v3" in ver:
+        return "NO_RETEST"
+    return "UNKNOWN"
+
+
+def _trend_from_ma(facts: dict) -> str:
+    c, m20, m50 = facts.get("close"), facts.get("ma20"), facts.get("ma50")
+    m100, m200 = facts.get("ma100"), facts.get("ma200")
+    if not facts.get("ma_available") or c is None or m20 is None:
+        return "UNKNOWN"
+    above = sum(
+        1
+        for m in (m20, m50, m100, m200)
+        if m is not None and c > m
+    )
+    below = sum(
+        1
+        for m in (m20, m50, m100, m200)
+        if m is not None and c < m
+    )
+    if above >= 3 and (m50 is None or m20 >= m50 * 0.995):
+        return "BULLISH"
+    if below >= 3:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def _pe_class(pe, p=ENGINE_PARAMS) -> str:
+    if pe is None:
+        return "UNKNOWN"
+    if pe < p["pe_low"]:
+        return "LOW"
+    if pe <= p["pe_high"]:
+        return "MODERATE"
+    return "HIGH"
+
+
+def _pb_class(pb, p=ENGINE_PARAMS) -> str:
+    if pb is None:
+        return "UNKNOWN"
+    if pb < p["pb_low"]:
+        return "LOW"
+    if pb <= p["pb_high"]:
+        return "MODERATE"
+    return "HIGH"
+
+
+def _roe_class(roe, p=ENGINE_PARAMS) -> str:
+    if roe is None:
+        return "UNKNOWN"
+    if roe < p["roe_weak"]:
+        return "WEAK"
+    if roe < p["roe_strong"]:
+        return "MODERATE"
+    return "STRONG"
+
+
+def _normalize_market_regime(label: str) -> str:
+    u = (label or "UNKNOWN").upper()
+    if u in ("UNKNOWN", ""):
+        return "UNKNOWN"
+    if "BULL" in u:
+        return "BULLISH"
+    if "BEAR" in u:
+        return "BEARISH"
+    if "NEUTRAL" in u or "SIDE" in u or "RANGE" in u:
+        return "NEUTRAL"
+    return "UNKNOWN"
+
+
+def build_signals(facts: dict, p: dict | None = None) -> dict[str, Any]:
+    """Layer SIGNAL — deterministic dari FACT."""
+    p = p or ENGINE_PARAMS
+    trend = _trend_from_ma(facts)
+    roc = facts.get("roc")
+    adx = facts.get("adx")
+    if roc is not None and roc > 0:
+        momentum = "POSITIVE"
+    elif roc is not None and roc < 0:
+        momentum = "NEGATIVE"
+    else:
+        momentum = "UNKNOWN"
+
+    fib_state, fib_dist_atr = _classify_fib_distance(
+        facts.get("close"), facts.get("fib382"), facts.get("atr"), p
+    )
+    fib_ref = "fib382"
+    if fib_state is None and facts.get("fib618") is not None:
+        fib_state, fib_dist_atr = _classify_fib_distance(
+            facts.get("close"), facts.get("fib618"), facts.get("atr"), p
+        )
+        fib_ref = "fib618"
+
+    # Interpretasi Fibo: AT_LEVEL ≠ resistance rejection
+    if fib_state == "AT_LEVEL":
+        fib_note = (
+            f"Harga praktis di level ({fib_ref}); jarak {fib_dist_atr}×ATR. "
+            "BUKAN otomatis resistance/weakness."
+        )
+    elif fib_state == "NEAR_LEVEL":
+        fib_note = f"Dekat {fib_ref} ({fib_dist_atr}×ATR); level masih relevan."
+    elif fib_state == "AWAY":
+        fib_note = f"Menjauh dari {fib_ref} ({fib_dist_atr}×ATR)."
+    elif fib_state == "FAR":
+        fib_note = f"Jauh dari {fib_ref}; level kurang relevan untuk setup immediate."
+    else:
+        fib_note = "Data Fibo/ATR tidak cukup untuk klasifikasi."
+
+    retest = _retest_status(facts)
+    retest_note = {
+        "NO_RETEST": "Belum ada uji ulang level yang terkonfirmasi — netral, bukan gagal.",
+        "VALID_RETEST": "Retest hold / konfirmasi positif.",
+        "FAILED_RETEST": "Uji level gagal (breakdown) — negatif.",
+        "UNKNOWN": "Field retest tidak ada di report strategi ini — jangan diasumsikan gagal.",
+    }.get(retest, "")
+
+    market = _normalize_market_regime(str(facts.get("ihsg_regime_raw") or "UNKNOWN"))
+    market_note = (
+        "IHSG belum/tidak tersedia → netral (bukan bearish)."
+        if market == "UNKNOWN"
+        else (
+            "Headwind indeks (bukan death-cross emiten)."
+            if market == "BEARISH"
+            else (
+                "Tailwind indeks."
+                if market == "BULLISH"
+                else "Indeks netral/sideways."
+            )
+        )
+    )
+
+    pe_c = _pe_class(facts.get("pe"), p)
+    pb_c = _pb_class(facts.get("pb"), p)
+    roe_c = _roe_class(facts.get("roe"), p)
+
+    # Jangan pernah label OVERVALUED tanpa peer/historical di JSON
+    if pb_c == "HIGH" and pe_c in ("MODERATE", "LOW", "UNKNOWN"):
+        val_sig = "PBV_PREMIUM"
+    elif pe_c == "HIGH" and pb_c == "HIGH":
+        val_sig = "PREMIUM_BOTH"
+    elif pe_c == "LOW" and pb_c in ("LOW", "MODERATE"):
+        val_sig = "VALUE_LEAN"
+    elif pe_c == "UNKNOWN" and pb_c == "UNKNOWN":
+        val_sig = "UNKNOWN"
+    else:
+        val_sig = "MIXED"
+    val_note = (
+        f"PE={pe_c}, PBV={pb_c}, ROE={roe_c}. "
+        f"Signal={val_sig}. Bukan OVERVALUED tanpa peer/historical."
+    )
+
+    w1, w2 = p["rr_tp1_weight"], p["rr_tp2_weight"]
+    rr1, rr2 = facts.get("rr_tp1"), facts.get("rr_tp2")
+    if rr1 is not None and rr2 is not None:
+        expected_rr = round(w1 * rr1 + w2 * rr2, 2)
+    elif rr1 is not None:
+        expected_rr = rr1
+    else:
+        expected_rr = facts.get("rr_screener")
+
+    # Risk breakdown
+    atr = facts.get("atr")
+    entry = facts.get("entry")
+    sl = facts.get("sl")
+    vol_risk = None
+    if atr and entry and entry > 0:
+        vol_risk = round(atr / entry * 100, 2)
+    acct_risk = facts.get("account_risk_pct")
+
+    return {
+        "trend_signal": trend,
+        "momentum_signal": momentum,
+        "adx": adx,
+        "fib_signal": fib_state or "UNKNOWN",
+        "fib_ref": fib_ref,
+        "fib_distance_atr": fib_dist_atr,
+        "fib_note": fib_note,
+        "retest_status": retest,
+        "retest_note": retest_note,
+        "market_regime": market,
+        "market_note": market_note,
+        "pe_class": pe_c,
+        "pb_class": pb_c,
+        "roe_class": roe_c,
+        "valuation_signal": val_sig,
+        "valuation_note": val_note,
+        "forbid_overvalued_label": True,
+        "rr_tp1": rr1,
+        "rr_tp2": rr2,
+        "expected_rr": expected_rr,
+        "rr_headline": (
+            f"TP1={rr1}R" + (f" | TP2={rr2}R" if rr2 is not None else "")
+            + (f" | Expected={expected_rr}R" if expected_rr is not None else "")
+            if rr1 is not None
+            else None
+        ),
+        "account_risk_pct": acct_risk,
+        "volatility_risk_pct": vol_risk,
+        "risk_note": (
+            f"Account risk={acct_risk}% vs cfg; volatility (ATR/price)={vol_risk}%. "
+            "Critic fokus setup/market; Risk role fokus account+fee."
+        ),
+    }
+
+
+def build_scores(signals: dict, facts: dict, p: dict | None = None) -> dict[str, Any]:
+    """Layer SCORE — angka 0–100 + breakdown."""
+    p = p or ENGINE_PARAMS
+    tech = 50.0
+    if signals["trend_signal"] == "BULLISH":
+        tech += 15
+    elif signals["trend_signal"] == "BEARISH":
+        tech -= 15
+    if signals["momentum_signal"] == "POSITIVE":
+        tech += 10
+    elif signals["momentum_signal"] == "NEGATIVE":
+        tech -= 10
+    adx = signals.get("adx")
+    if adx is not None and adx >= 25:
+        tech += 8
+    elif adx is not None and adx < 18:
+        tech -= 5
+    # Fibo: AT_LEVEL netral/positif ringan; FAR sedikit negatif untuk setup fib
+    fs = signals.get("fib_signal")
+    if fs == "AT_LEVEL":
+        tech += 5
+    elif fs == "NEAR_LEVEL":
+        tech += 2
+    elif fs == "FAR":
+        tech -= 3
+    # Retest: NO_RETEST = 0; VALID +; FAILED -
+    rs = signals.get("retest_status")
+    if rs == "VALID_RETEST":
+        tech += 10
+    elif rs == "FAILED_RETEST":
+        tech -= 12
+    # NO_RETEST / UNKNOWN → 0
+    tech = max(0, min(100, tech))
+
+    fund = 50.0
+    if signals["pe_class"] == "LOW":
+        fund += 8
+    elif signals["pe_class"] == "HIGH":
+        fund -= 5
+    if signals["pb_class"] == "HIGH":
+        fund -= 5  # premium, bukan overvalued crash
+    elif signals["pb_class"] == "LOW":
+        fund += 5
+    if signals["roe_class"] == "STRONG":
+        fund += 12
+    elif signals["roe_class"] == "WEAK":
+        fund -= 8
+    if signals["valuation_signal"] == "PBV_PREMIUM":
+        fund -= 3
+    conf = str(facts.get("fund_confidence") or "").lower()
+    if conf in ("low", "medium") or str(facts.get("fund_source") or "").lower() == "yfinance":
+        fund = 40 + (fund - 50) * 0.5  # compress toward 40-60
+    fund = max(0, min(100, fund))
+
+    risk_s = 50.0
+    arp = signals.get("account_risk_pct")
+    cfg = facts.get("risk_pct_cfg") or 1.0
+    if arp is not None:
+        if arp <= cfg:
+            risk_s += 15
+        elif arp <= cfg * 1.5:
+            risk_s += 0
+        else:
+            risk_s -= 15
+    err = signals.get("expected_rr")
+    if err is not None:
+        if err >= 2.0:
+            risk_s += 15
+        elif err >= 1.5:
+            risk_s += 8
+        elif err < 1.2:
+            risk_s -= 12
+    risk_s = max(0, min(100, risk_s))
+
+    # Market: UNKNOWN → 0 adjustment (score 50)
+    mr = signals.get("market_regime")
+    if mr == "BULLISH":
+        mkt = 65.0
+    elif mr == "BEARISH":
+        mkt = 35.0
+    elif mr == "NEUTRAL":
+        mkt = 50.0
+    else:
+        mkt = 50.0  # UNKNOWN
+
+    catalyst = 50.0  # news not scored hard without structured tone
+
+    final = (
+        p["score_tech_w"] * tech
+        + p["score_fund_w"] * fund
+        + p["score_risk_w"] * risk_s
+        + p["score_market_w"] * mkt
+        + p["score_catalyst_w"] * catalyst
+    )
+    final = round(max(0, min(100, final)), 1)
+
+    return {
+        "technical_score": round(tech, 1),
+        "fundamental_score": round(fund, 1),
+        "risk_score": round(risk_s, 1),
+        "market_score": round(mkt, 1),
+        "catalyst_score": round(catalyst, 1),
+        "final_score": final,
+        "weights": {
+            "technical": p["score_tech_w"],
+            "fundamental": p["score_fund_w"],
+            "risk": p["score_risk_w"],
+            "market": p["score_market_w"],
+            "catalyst": p["score_catalyst_w"],
+        },
+    }
+
+
+def derive_stance(scores: dict, signals: dict, facts: dict) -> str:
+    """Deterministic stance rules."""
+    if not facts.get("close") and not facts.get("entry"):
+        return "INSUFFICIENT_DATA"
+    final = scores.get("final_score") or 0
+    risk_ok = (signals.get("account_risk_pct") is None) or (
+        signals.get("account_risk_pct") <= (facts.get("risk_pct_cfg") or 1.0) * 1.25
+    )
+    if signals.get("retest_status") == "FAILED_RETEST" and final < 70:
+        return "AVOID"
+    if final >= 80 and risk_ok:
+        return "STRONG_SETUP"
+    if final >= 70 and risk_ok:
+        return "SETUP"
+    if final >= 55:
+        return "WATCH"
+    if final >= 40:
+        return "WAIT"
+    return "AVOID"
+
+
+def data_quality_report(facts: dict, signals: dict) -> dict[str, str]:
+    return {
+        "technical": "COMPLETE" if facts.get("ma_available") or facts.get("close") else "PARTIAL",
+        "fundamental": (
+            "COMPLETE"
+            if facts.get("fund_confidence") == "high"
+            else ("PARTIAL" if facts.get("pe") or facts.get("pb") else "UNKNOWN")
+        ),
+        "market_regime": (
+            "COMPLETE"
+            if signals.get("market_regime") not in (None, "UNKNOWN")
+            else "UNKNOWN"
+        ),
+        "overall": "PARTIAL",
+    }
+
+
+def render_engine_scorecard(engine: dict, ticker: str = "TICKER") -> str:
+    """Scorecard teks wajib dipakai Chief (tidak diganti model)."""
+    sig = engine.get("signals") or {}
+    sc = engine.get("scores") or {}
+    t = (ticker or "TICKER").upper()
+
+    def _dir(trend: str) -> str:
+        u = (trend or "").upper()
+        if "BULL" in u:
+            return "Bullish"
+        if "BEAR" in u:
+            return "Bearish"
+        return "Netral"
+
+    lines = [
+        f"### SCORECARD ENGINE — {t} (deterministik, jangan diubah)",
+        f"- Teknikal: {_dir(sig.get('trend_signal'))} {sc.get('technical_score')}%",
+        f"- Fundamental: {_dir('BULLISH' if sig.get('roe_class')=='STRONG' and sig.get('valuation_signal')!='PREMIUM_BOTH' else 'NEUTRAL')} {sc.get('fundamental_score')}%",
+        f"- Pasar IHSG: {sig.get('market_regime')} {sc.get('market_score')}% — {sig.get('market_note')}",
+        f"- **Final: {sc.get('final_score')}/100** · stance: **{engine.get('stance')}**",
+        f"- R:R headline: {sig.get('rr_headline')}",
+        f"- Fibo: {sig.get('fib_signal')} (dist {sig.get('fib_distance_atr')} ATR) — {sig.get('fib_note')}",
+        f"- Retest: {sig.get('retest_status')} — {sig.get('retest_note')}",
+        f"- Valuasi: {sig.get('valuation_signal')} — {sig.get('valuation_note')}",
+        f"- Risk: account {sig.get('account_risk_pct')}% | vol ATR {sig.get('volatility_risk_pct')}%",
+        f"- Breakdown skor: tech={sc.get('technical_score')} fund={sc.get('fundamental_score')} "
+        f"risk={sc.get('risk_score')} mkt={sc.get('market_score')} "
+        f"(weights {sc.get('weights')})",
+    ]
+    return "\n".join(lines)
+
+
+def run_analysis_engine(context: dict, params: dict | None = None) -> dict[str, Any]:
+    """Pipeline penuh: facts → signals → scores → stance (+ debug)."""
+    p = {**ENGINE_PARAMS, **(params or {})}
+    facts = build_facts(context)
+    signals = build_signals(facts, p)
+    scores = build_scores(signals, facts, p)
+    stance = derive_stance(scores, signals, facts)
+    dq = data_quality_report(facts, signals)
+    eng = {
+        "facts": facts,
+        "signals": signals,
+        "scores": scores,
+        "stance": stance,
+        "data_quality": dq,
+        "engine_version": "v3-spec-p0.2",
+        "instructions_for_llm": (
+            "engine.* = kebenaran deterministik. Jangan ubah signal/skor/stance. "
+            "NO_RETEST ≠ gagal. fib AT_LEVEL ≠ resistance rejection. "
+            "market UNKNOWN ≠ bearish. PBV_PREMIUM ≠ OVERVALUED. "
+            "Pakai scorecard_text apa adanya di awal jawaban Chief."
+        ),
+    }
+    eng["scorecard_text"] = render_engine_scorecard(
+        eng, str(facts.get("ticker") or context.get("ticker") or "TICKER")
+    )
+    return eng
+
+
 SYSTEM_PROMPTS = {
-    "technical": """Kamu adalah analis teknikal pasar saham Indonesia (IDX).
-Hanya gunakan data JSON yang diberikan. Jangan mengarang harga atau indikator.
-Fokus: kualitas setup (entry, SL, TP, RR), struktur, risiko false breakout/sweep,
-apakah level masuk akal untuk karakter BEI (tick, volatilitas).
-Rujuk angka di screener_row, price_snapshot, dan ma_structure secara eksplisit.
+    "technical": """Kamu adalah analis teknikal IDX. Hanya data JSON. Jangan mengarang.
 
-WAJIB bahas field ma_structure bila available=true:
-- Nilai MA20 / MA50 / MA100 / MA200 dan last_close
-- Harga di atas atau di bawah masing-masing MA (price_vs_ma + dist_pct)
-- Susunan MA (stack) bullish/bearish/campur
-- Golden cross atau death cross (crosses): pasangan mana, direction_last_cross,
-  days_since_cross, apakah cross_fresh (≤10h) / cross_recent (≤30h) / sudah lama
-- Slope MA20 (ma20_slope_5d_pct) bila ada
-- Kaitkan dengan setup screener: mendukung, netral, atau bertentangan
+UTAMAKAN field **engine.signals** dan **engine.facts** (deterministik):
+- trend_signal, momentum_signal, fib_signal, fib_distance_atr, retest_status
+- RR: engine.signals.rr_tp1, rr_tp2, expected_rr (bukan hanya TP1)
+- retest_status: NO_RETEST | VALID_RETEST | FAILED_RETEST | UNKNOWN
+  * NO_RETEST = belum diuji, BUKAN kegagalan, tanpa penalti naratif
+  * FAILED_RETEST saja yang boleh disebut gagal
+- fib_signal AT_LEVEL / NEAR_LEVEL: jangan red-flag hanya karena close < fib382
+  jika fib_distance_atr kecil (dekat level)
 
-Jika ma_structure.available=false, sebut data MA tidak tersedia — jangan mengarang.
-Jika ada llmquant.quant_wiki, boleh pakai sebagai kerangka istilah (OB, FVG, liquidity) tanpa mengarang level harga.
-Jawab dalam Bahasa Indonesia, terstruktur, poin-poin. Bukan saran investasi.""",
-    "fundamental": """Kamu adalah analis fundamental saham Indonesia (IDX).
-Hanya gunakan field "fundamental", "news_intel", "llmquant", dan "screener_row" pada JSON.
-Jika data terbatas/null, katakan secara eksplisit — jangan mengarang.
-Fokus:
-- Valuasi kasar (PE, PB, EPS, market cap) vs konteks sektor bila ada
-- Undervalued / fair / premium secara kualitatif dari angka yang ada
-- Risiko bisnis singkat (sektor, profitabilitas bila ada)
-- Ringkas berita/headline relevan di news_intel (katalis positif/negatif, corporate action)
-- Jika ada llmquant.quant_wiki / quant_papers: pakai hanya sebagai kerangka konsep quant (bukan fakta harga emiten)
-- Apakah fundamental + berita mendukung ATAU bertentangan dengan setup teknikal jangka pendek
-WAJIB sebutkan fundamental.source dan fundamental.confidence.
-Jika source=yfinance atau confidence=low/medium: tekankan ketidakpastian data IDX di Yahoo,
-sarankan verifikasi manual lewat fundamental.sectors_company_url / sectors_news_url, dan jangan overconfident pada PE/PB.
-Jawab Bahasa Indonesia, poin-poin. Bukan saran investasi. Horizon: swing pendek–menengah.""",
-    "risk": """Kamu adalah risk manager trading IDX.
-Hanya gunakan data JSON yang diberikan.
-Fokus: posisi size (lots), risiko vs account, jarak SL, dampak fee beli/jual +
-perkiraan pajak Indonesia (PPN atas fee, levy, PPh final jual 0.1%) secara kualitatif,
-likuiditas jika ada di data.
-Jawab Bahasa Indonesia, singkat, poin. Bukan saran investasi.""",
-    "critic": """Kamu adalah devil's advocate / risk skeptic.
-Tugas: cari alasan setup ini GAGAL atau sebaiknya dihindari.
-Gabungkan celah teknikal, fundamental, berita (news_intel), dan konteks makro/konsep di llmquant bila ada:
-valuasi mahal, data kosong, sektor lemah, headline negatif, makro global tidak mendukung risk-on.
-Sebut invalidation, skenario worst-case, dan red flags dari data JSON saja.
-Jangan mengarang berita di luar news_intel. Jangan memuji setup.
+PISAHKAN:
+A) Tren **emiten** (engine + ma_structure)
+B) Regime **IHSG** (engine.signals.market_regime) — last_close indeks bukan harga saham
+
+LARANGAN: PE/PB/valuasi; menyamakan MA IHSG dengan MA emiten.
+Jelaskan WHY dari engine; jangan mengubah signal engine.
 Bahasa Indonesia, poin. Bukan saran investasi.""",
-    "chief": """Kamu adalah head trader assistant yang merangkum analisa
-technical, fundamental, risk, critic, berita (news_intel), dan llmquant (makro/wiki quant) bila ada.
+    "fundamental": """Analis fundamental IDX. Angka hanya canonical_valuation / engine.facts.
 
-WAJIB output bagian **SCORECARD BIAS** di paling atas, format persis seperti ini
-(ganti TICKER, arah, dan % sesuai penilaianmu dari data — jangan mengarang angka harga):
+Gunakan engine.signals:
+- pe_class, pb_class, roe_class, valuation_signal
+- valuation_signal PBV_PREMIUM ≠ OVERVALUED (tanpa peer/historical)
+- Jangan tulis OVERVALUED kecuali ada pembanding di JSON
+
+Sebut source + confidence. yfinance = ketidakpastian.
+Bahasa Indonesia, poin. Bukan saran investasi.""",
+    "risk": """Risk manager IDX. Fokus lots, account_risk_pct (engine), SL vs ATR,
+fee/pajak, expected_rr (TP1+TP2).
+
+engine.signals.market_regime BEARISH = headwind konteks, bukan invalidasi SL.
+UNKNOWN market = netral (bukan negatif).
+Bahasa Indonesia, singkat. Bukan saran investasi.""",
+    "critic": """Devil's advocate. Kritik dari engine + JSON saja.
+
+- Jangan sebut retest gagal jika retest_status = NO_RETEST atau VALID_RETEST
+- Jangan samakan regime IHSG dengan death-cross emiten
+- PBV_PREMIUM boleh dikritik sebagai premium, bukan otomatis overvalued
+- market_regime UNKNOWN ≠ red flag bearish
+- Sebut RR expected vs hanya TP1 jika relevan
+
+Bahasa Indonesia, poin. Bukan saran investasi.""",
+    "chief": """Head trader. AI MENJELASKAN hasil engine; JANGAN mengarang skor baru.
+
+WAJIB pakai engine.scores dan engine.stance sebagai sumber skor:
+- technical_score, fundamental_score, risk_score, market_score, final_score
+- stance: STRONG_SETUP | SETUP | WATCH | WAIT | AVOID | INSUFFICIENT_DATA
+
+SCORECARD (salin angka engine, mapping arah dari signals):
 
 ### SCORECARD BIAS — {TICKER}
-- Teknikal: {Bullish|Bearish|Netral} {0-100}%
-- Berita: {Bullish|Bearish|Netral} {0-100}%
-- Fundamental: {Bullish|Bearish|Netral} {0-100}%
-- **Overall: {Bullish|Bearish|Netral} {0-100}%** · rekomendasi stance: {avoid|watch|consider}
-- Fundamental confidence: {high|medium|low} ({fundamental.source})
-- Berita Sectors (filter emiten): {news_intel.sectors_news_url}
-- Profil/fundamental Sectors (verifikasi manual): {fundamental.sectors_company_url}
+- Teknikal: {Bullish|Bearish|Netral} {engine.scores.technical_score}%
+- Fundamental: {arah dari valuation/ROE} {engine.scores.fundamental_score}%
+- Pasar IHSG: {engine.signals.market_regime} {engine.scores.market_score}%
+- **Final (engine): {engine.scores.final_score}/100** · stance: {engine.stance}
+- Fundamental confidence: ...
+- Link Sectors berita + profil
 
-Aturan skor %:
-- Teknikal: kualitas setup entry/SL/TP/RR, struktur, risiko false breakout, serta posisi harga vs MA / golden-death cross dari ma_structure (dari analisa technical + risk).
-- Berita: tone_hint + headline di news_intel (+ critic bila relevan). Jika headline kosong → Netral 50% dan sebut data terbatas.
-- Fundamental: valuasi/PE-PB/EPS dari field fundamental. Jika data null → Netral 50% dan sebut data terbatas.
-- **Penalti confidence yfinance (WAJIB):**
-  - Jika fundamental.source == "yfinance" ATAU fundamental.confidence in ("low","medium"):
-    - Bobot fundamental di Overall diturunkan (pakai ~15% bukan 30%; teknikal ~50%, berita ~35%).
-    - Jangan biarkan skor Fundamental ekstrem (>75 atau <25) hanya dari PE/PB Yahoo — clamp ke kisaran 40–60 kecuali berita/analisa lain sangat mendukung.
-    - Cantumkan di scorecard: `confidence: low (yfinance — verifikasi manual)`.
-  - Jika source idx_fundamental / override / sectors: confidence high/medium, bobot normal (~30%).
-- Overall: rata tertimbang sesuai aturan di atas, lalu sesuaikan jika critic/makro sangat negatif atau positif.
-- Jangan pernah tulis "wajib beli/jual". Overall hanya avoid | watch | consider.
-- Setelah Overall, WAJIB dua baris deep-link Sectors (salin URL dari JSON bila ada):
-  - Berita Sectors (filter emiten): {news_intel.sectors_news_url}
-  - Profil/fundamental Sectors (verifikasi manual): {fundamental.sectors_company_url}
-  Jika URL kosong, gunakan:
-  - https://sectors.app/indonesia/news?nticker={TICKER}.JK
-  - https://sectors.app/idx/{ticker_lower}   (contoh ANTM → https://sectors.app/idx/antm)
-
-Setelah scorecard, lanjutkan:
-1) Skor setup 1-10 (satu angka + 1 kalimat alasan)
+Lalu jelaskan:
+1) Breakdown singkat kenapa final_score terbentuk (weights di engine.scores)
 2) Tiga syarat sebelum entry
-3) Tiga red flags
-4) Catatan singkat fundamental + berita + makro (2-3 kalimat)
-5) Satu kalimat kesimpulan netral
+3) Key positives / key risks (pisah emiten vs IHSG)
+4) Retest + Fibo state dari engine.signals (NO_RETEST bukan gagal)
+5) Kesimpulan selaras stance engine
 
-Hanya berdasarkan data yang ada; jangan mengarang headline.
 Bahasa Indonesia. Bukan financial advice.""",
 }
 
@@ -609,6 +1175,109 @@ def _load_fundamentals_override(ticker: str) -> dict[str, Any] | None:
     return out
 
 
+def sanitize_fundamental(fund: dict[str, Any] | None) -> dict[str, Any]:
+    """
+    Bersihkan metrik tidak masuk akal (sering dari yfinance IDX) dan
+    bangun canonical_valuation yang wajib dipakai semua role.
+    """
+    if not fund or not isinstance(fund, dict):
+        return {
+            "available": False,
+            "source": "none",
+            "confidence": "low",
+            "rejected_metrics": {},
+            "canonical_valuation": {},
+        }
+
+    f = dict(fund)
+    rejected: dict[str, str] = {}
+
+    def _reject(key: str, reason: str) -> None:
+        if f.get(key) is not None:
+            rejected[key] = f"{f.get(key)} ({reason})"
+            f[key] = None
+
+    pe = _safe_float(f.get("pe_ratio"))
+    pb = _safe_float(f.get("pb_ratio"))
+    div_y = _safe_float(f.get("dividend_yield_pct"))
+    roe = _safe_float(f.get("roe"))
+    eps = _safe_float(f.get("eps"))
+
+    # PB absurd (contoh 17397) = error data, bukan overvalued
+    if pb is not None and (pb < 0 or pb > 25):
+        _reject("pb_ratio", "di luar rentang wajar IDX 0–25")
+        pb = None
+    if pe is not None and (pe > 120 or pe < -50):
+        _reject("pe_ratio", "di luar rentang wajar")
+        pe = None
+    # Dividend: kadang 1.65 (=165%) atau 165
+    if div_y is not None:
+        if div_y > 30:
+            # coba skala jika terlihat 100x
+            if 30 < div_y <= 300:
+                rejected["dividend_yield_pct"] = f"{div_y} (mencurigakan; diabaikan)"
+                f["dividend_yield_pct"] = None
+                div_y = None
+            else:
+                _reject("dividend_yield_pct", "tidak wajar >30%")
+                div_y = None
+    if roe is not None and abs(roe) > 100:
+        _reject("roe", "tidak wajar |roe|>100")
+        roe = None
+
+    src = str(f.get("source") or "unknown")
+    conf = str(f.get("confidence") or "low")
+    # Override / Stockbit = high
+    if any(x in src.lower() for x in ("override", "stockbit", "laporan", "idx_fundamental")):
+        conf = f.get("confidence") or "high"
+        f["confidence"] = conf
+
+    canonical = {
+        "ticker": f.get("ticker"),
+        "source": src,
+        "confidence": f.get("confidence") or conf,
+        "pe_ratio": pe if pe is not None else f.get("pe_ratio"),
+        "pb_ratio": pb if pb is not None else f.get("pb_ratio"),
+        "eps": eps if eps is not None else f.get("eps"),
+        "roe": roe if roe is not None else f.get("roe"),
+        "dividend_yield_pct": div_y if div_y is not None else f.get("dividend_yield_pct"),
+        "profit_margin_pct": f.get("profit_margin_pct"),
+        "debt_to_equity": f.get("debt_to_equity"),
+        "market_cap": f.get("market_cap"),
+        "valuation_note": f.get("valuation_note"),
+        "as_of": f.get("as_of"),
+        "sectors_company_url": f.get("sectors_company_url"),
+        "sectors_news_url": f.get("sectors_news_url"),
+        "instruction": (
+            "SEMUA role wajib memakai angka valuasi HANYA dari objek ini. "
+            "Abaikan PE/PB yang disebut role lain jika berbeda."
+        ),
+    }
+    # sinkron field utama yang di-null
+    if "pb_ratio" in rejected:
+        canonical["pb_ratio"] = None
+        f["pb_ratio"] = None
+    if "pe_ratio" in rejected:
+        canonical["pe_ratio"] = None
+        f["pe_ratio"] = None
+    if "dividend_yield_pct" in rejected:
+        canonical["dividend_yield_pct"] = None
+    if "roe" in rejected:
+        canonical["roe"] = None
+        f["roe"] = None
+
+    f["rejected_metrics"] = rejected
+    f["canonical_valuation"] = canonical
+    if rejected:
+        note = f.get("confidence_note") or ""
+        f["confidence_note"] = (
+            (note + " " if note else "")
+            + "Metrik ditolak (data invalid): "
+            + ", ".join(rejected.keys())
+        ).strip()
+    return f
+
+
 def fetch_fundamental(ticker: str) -> dict[str, Any]:
     """Ambil fundamental: override CSV → idx_fundamental → yfinance."""
     ticker = str(ticker).upper().strip().replace(".JK", "")
@@ -617,7 +1286,7 @@ def fetch_fundamental(ticker: str) -> dict[str, Any]:
     try:
         ov = _load_fundamentals_override(ticker)
         if ov:
-            return ov
+            return sanitize_fundamental(ov)
     except Exception:
         pass
 
@@ -633,7 +1302,7 @@ def fetch_fundamental(ticker: str) -> dict[str, Any]:
             urls = _sectors_urls(ticker)
             snap.setdefault("sectors_company_url", urls["sectors_company_url"])
             snap.setdefault("sectors_news_url", urls["sectors_news_url"])
-            return snap
+            return sanitize_fundamental(snap)
     except Exception:
         pass
 
@@ -725,7 +1394,7 @@ def fetch_fundamental(ticker: str) -> dict[str, Any]:
         )
     except Exception as e:
         out["error"] = str(e)
-    return out
+    return sanitize_fundamental(out)
 
 
 
@@ -1185,9 +1854,42 @@ def build_context(
             }
     if include_fundamental:
         fund = fetch_fundamental(ticker)
+        # Jangan campur metrik CSV screener yang bisa bentrok / field salah
+        # (mis. kolom mengandung 'pe' tapi bukan PE ratio).
         if csv_fund:
-            fund["from_screener_csv"] = csv_fund
+            fund["from_screener_csv_raw"] = csv_fund
+        fund = sanitize_fundamental(fund)
         ctx["fundamental"] = fund
+        ctx["canonical_valuation"] = fund.get("canonical_valuation") or {}
+        # Petunjuk kontrak data untuk semua role
+        ctx["data_contract"] = {
+            "valuation_source": "canonical_valuation only",
+            "technical_roles_forbid_valuation": True,
+            "regime_is_ihsg_index_only": True,
+            "regime_last_close_is_ihsg_index": True,
+            "ticker_trend_source": "ma_structure + screener_row (bukan regime.reason)",
+            "setup_truth_source": "screener_row (RetestOK, Alasan, Fibo, Score)",
+            "do_not_merge_ihsg_ma_with_ticker_ma": True,
+            "rejected_metrics": fund.get("rejected_metrics") or {},
+        }
+        # Alias eksplisit agar model tidak salah baca
+        if regime:
+            ctx["market_regime"] = {
+                **regime,
+                "_note": (
+                    "Ini kondisi INDEKS IHSG. last_close = level IHSG. "
+                    "reason tentang MA mengacu ke IHSG, bukan emiten."
+                ),
+            }
+    # Engine deterministik — berlaku semua strategy (v2–v5, intra, hb, acc)
+    try:
+        ctx["engine"] = run_analysis_engine(ctx)
+    except Exception as e:
+        ctx["engine"] = {
+            "error": str(e),
+            "stance": "INSUFFICIENT_DATA",
+            "instructions_for_llm": "Engine gagal; jangan mengarang skor.",
+        }
     if include_news:
         try:
             ctx["news_intel"] = fetch_news_intel(ticker)
@@ -1287,6 +1989,60 @@ def _extract_message_content(data: dict) -> str:
     return text
 
 
+def _uses_max_completion_tokens(model: str) -> bool:
+    """
+    Model baru OpenAI (gpt-5*, o1*, o3*, o4*) menolak max_tokens;
+    wajib max_completion_tokens.
+    """
+    m = (model or "").lower().strip()
+    if not m:
+        return False
+    prefixes = (
+        "gpt-5",
+        "o1",
+        "o3",
+        "o4",
+        "chatgpt-5",
+    )
+    return any(m.startswith(p) for p in prefixes)
+
+
+def _build_chat_body(
+    *,
+    model: str,
+    system: str,
+    user: str,
+    temperature: float,
+    max_tokens: int,
+    use_max_completion_tokens: bool | None = None,
+) -> dict:
+    body: dict = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    # reasoning models sering menolak temperature custom
+    if not _uses_max_completion_tokens(model):
+        body["temperature"] = temperature
+    else:
+        # gpt-5 / o-series: hanya set temperature jika env mengizinkan
+        if os.environ.get("OPENAI_FORCE_TEMPERATURE", "").strip() in ("1", "true", "yes"):
+            body["temperature"] = temperature
+
+    use_mct = (
+        use_max_completion_tokens
+        if use_max_completion_tokens is not None
+        else _uses_max_completion_tokens(model)
+    )
+    if use_mct:
+        body["max_completion_tokens"] = int(max_tokens)
+    else:
+        body["max_tokens"] = int(max_tokens)
+    return body
+
+
 def _chat(
     system: str,
     user: str,
@@ -1310,17 +2066,14 @@ def _chat(
     import urllib.request
     import urllib.error
 
-    payload = json.dumps(
-        {
-            "model": model,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        }
-    ).encode("utf-8")
+    body = _build_chat_body(
+        model=model,
+        system=system,
+        user=user,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    payload = json.dumps(body).encode("utf-8")
 
     last_err: Exception | None = None
     attempts = max(1, max_retries + 1)
@@ -1343,6 +2096,46 @@ def _chat(
         except urllib.error.HTTPError as he:
             err_body = he.read().decode("utf-8", errors="ignore")
             last_err = RuntimeError(f"HTTPError {he.code}: {err_body}")
+
+            # Auto-fallback: max_tokens → max_completion_tokens (model baru)
+            if he.code == 400 and "max_tokens" in err_body and "max_completion_tokens" in err_body:
+                body = _build_chat_body(
+                    model=model,
+                    system=system,
+                    user=user,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    use_max_completion_tokens=True,
+                )
+                payload = json.dumps(body).encode("utf-8")
+                if attempt < attempts:
+                    continue
+                # coba sekali lagi meski attempt terakhir
+                try:
+                    req2 = urllib.request.Request(
+                        f"{base_url}/chat/completions",
+                        data=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {api_key}",
+                        },
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req2, timeout=timeout_sec) as r2:
+                        raw2 = r2.read().decode("utf-8")
+                    return _extract_message_content(json.loads(raw2))
+                except Exception as e2:
+                    last_err = e2
+
+            # Auto-fallback: buang temperature jika model menolak
+            if he.code == 400 and "temperature" in err_body.lower():
+                body.pop("temperature", None)
+                if "max_tokens" in body and _uses_max_completion_tokens(model):
+                    body["max_completion_tokens"] = body.pop("max_tokens")
+                payload = json.dumps(body).encode("utf-8")
+                if attempt < attempts:
+                    continue
+
             if he.code in (429, 500, 502, 503, 504) and attempt < attempts:
                 time.sleep(min(2 ** attempt, 8))
                 continue
@@ -1518,7 +2311,9 @@ def run_agents(
 
     if "chief" in roles:
         ok = {k: v for k, v in analyses.items() if not str(v).startswith("[Gagal]")}
-        if not ok:
+        eng = context.get("engine") or {}
+        scorecard = eng.get("scorecard_text") or ""
+        if not ok and not scorecard:
             analyses["chief"] = (
                 "[Gagal] Tidak ada analisa role yang berhasil; chief dilewati. "
                 + ("; ".join(f"{k}: {v}" for k, v in errors.items()) or "")
@@ -1527,13 +2322,39 @@ def run_agents(
         else:
             try:
                 analyses["chief"] = run_role(
-                    "chief", {**context, "analyses": ok}, model=model
+                    "chief",
+                    {
+                        **context,
+                        "analyses": ok,
+                        "engine_scorecard_locked": scorecard,
+                    },
+                    model=model,
                 )
             except Exception as e:
                 errors["chief"] = _format_llm_error(e)
                 analyses["chief"] = f"[Gagal] {errors['chief']}"
             else:
-                # Pastikan link Sectors selalu ada setelah Overall di scorecard
+                # Paksa scorecard engine di atas (model tidak boleh menimpa angka)
+                body = analyses["chief"] or ""
+                if scorecard:
+                    # Buang scorecard lama model jika ada, prepend locked card
+                    lines = body.splitlines()
+                    filtered = []
+                    skip = False
+                    for ln in lines:
+                        if "SCORECARD" in ln.upper() and "ENGINE" not in ln.upper():
+                            skip = True
+                            continue
+                        if skip and (
+                            ln.startswith("- ")
+                            or ln.startswith("**")
+                            or "Overall" in ln
+                            or "stance" in ln.lower()
+                        ):
+                            continue
+                        skip = False
+                        filtered.append(ln)
+                    analyses["chief"] = scorecard + "\n\n" + "\n".join(filtered).strip()
                 analyses["chief"] = _ensure_sectors_link_in_chief(
                     analyses["chief"], context
                 )
@@ -1545,6 +2366,7 @@ def run_agents(
         "analyses": analyses,
         "errors": errors,
         "partial": bool(errors),
+        "engine": context.get("engine"),
         "context": context,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -1591,6 +2413,182 @@ def analyze_many(tickers: list[str], version: str, **kwargs) -> list[dict]:
     return [analyze_ticker(t, version, **kwargs) for t in tickers]
 
 
+def save_analysis_to_txt(
+    result: dict[str, Any],
+    path: str | Path | None = None,
+    *,
+    output_dir: str | Path = "ai_analysis_output",
+    include_errors: bool = True,
+    include_context_summary: bool = True,
+) -> str:
+    """
+    Simpan hasil analyse_ticker / run_agents ke file .txt.
+
+    Parameters
+    ----------
+    result : dict
+        Output dari analyze_ticker() atau run_agents().
+    path : optional
+        Path file tujuan. Jika None, dibuat otomatis:
+        {output_dir}/{TICKER}_{version}_{YYYYMMDD_HHMMSS}.txt
+    output_dir : str
+        Folder default bila path tidak diberikan.
+    include_errors : bool
+        Sertakan section errors bila ada.
+    include_context_summary : bool
+        Ringkas screener_row / fundamental / regime (bukan full JSON).
+
+    Returns
+    -------
+    str
+        Path absolut file yang ditulis.
+    """
+    if not isinstance(result, dict):
+        raise TypeError("result harus dict (output analyze_ticker/run_agents)")
+
+    ticker = str(result.get("ticker") or "UNKNOWN").upper().replace(".JK", "")
+    version = str(result.get("version") or result.get("screener_version") or "na")
+    generated = str(result.get("generated_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    if path is None:
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = out_dir / f"{ticker}_{version}_{stamp}.txt"
+    else:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines: list[str] = []
+    lines.append("=" * 72)
+    lines.append("IDX AI TRADER ASSISTANT — ANALISA")
+    lines.append("=" * 72)
+    lines.append(f"Ticker      : {ticker}")
+    lines.append(f"Screener    : {version}")
+    lines.append(f"Generated   : {generated}")
+    lines.append(f"Offline     : {result.get('offline', False)}")
+    lines.append(f"Partial     : {result.get('partial', False)}")
+    if result.get("error"):
+        lines.append(f"Error       : {result.get('error')}")
+    lines.append("")
+
+    eng = result.get("engine") or (result.get("context") or {}).get("engine")
+    if eng and isinstance(eng, dict) and not eng.get("error"):
+        lines.append("-" * 72)
+        lines.append("ENGINE (deterministik)")
+        lines.append("-" * 72)
+        sig = eng.get("signals") or {}
+        sc = eng.get("scores") or {}
+        lines.append(f"  trend={sig.get('trend_signal')} momentum={sig.get('momentum_signal')}")
+        lines.append(
+            f"  fib={sig.get('fib_signal')} dist_atr={sig.get('fib_distance_atr')} "
+            f"retest={sig.get('retest_status')}"
+        )
+        lines.append(
+            f"  market={sig.get('market_regime')} valuation={sig.get('valuation_signal')}"
+        )
+        lines.append(
+            f"  RR_tp1={sig.get('rr_tp1')} RR_tp2={sig.get('rr_tp2')} "
+            f"expected_RR={sig.get('expected_rr')}"
+        )
+        lines.append(
+            f"  scores: tech={sc.get('technical_score')} fund={sc.get('fundamental_score')} "
+            f"risk={sc.get('risk_score')} mkt={sc.get('market_score')} "
+            f"final={sc.get('final_score')}"
+        )
+        lines.append(f"  stance={eng.get('stance')} quality={eng.get('data_quality')}")
+        lines.append("")
+
+    # Ringkasan konteks (opsional)
+    ctx = result.get("context") or {}
+    if include_context_summary and ctx:
+        lines.append("-" * 72)
+        lines.append("RINGKASAN KONTEKS")
+        lines.append("-" * 72)
+        row = ctx.get("screener_row") or {}
+        if row:
+            lines.append("[Screener row]")
+            for k in (
+                "Ticker",
+                "SetupType",
+                "Close",
+                "EntryBreakout",
+                "Entry",
+                "StopLoss",
+                "Target1",
+                "Target",
+                "RR_Ratio",
+                "Score",
+                "Sweep",
+                "Alasan",
+            ):
+                if k in row and row[k] is not None:
+                    lines.append(f"  {k}: {row[k]}")
+            lines.append("")
+        fund = ctx.get("fundamental") or {}
+        if fund:
+            lines.append("[Fundamental]")
+            for k in (
+                "source",
+                "confidence",
+                "pe_ratio",
+                "pb_ratio",
+                "eps",
+                "roe",
+                "valuation_note",
+                "as_of",
+            ):
+                if fund.get(k) is not None:
+                    lines.append(f"  {k}: {fund.get(k)}")
+            lines.append("")
+        regime = ctx.get("regime") or {}
+        if regime:
+            lines.append("[Regime]")
+            for k, v in list(regime.items())[:12]:
+                lines.append(f"  {k}: {v}")
+            lines.append("")
+
+    # Analisa per role
+    analyses = result.get("analyses") or {}
+    role_order = list(ROLE_ORDER)
+    for role in role_order:
+        if role not in analyses:
+            continue
+        lines.append("=" * 72)
+        lines.append(f"ROLE: {role.upper()}")
+        lines.append("=" * 72)
+        text = analyses.get(role) or ""
+        lines.append(str(text).rstrip())
+        lines.append("")
+
+    # Role lain di luar urutan standar
+    for role, text in analyses.items():
+        if role in role_order:
+            continue
+        lines.append("=" * 72)
+        lines.append(f"ROLE: {role.upper()}")
+        lines.append("=" * 72)
+        lines.append(str(text or "").rstrip())
+        lines.append("")
+
+    errors = result.get("errors") or {}
+    if include_errors and errors:
+        lines.append("-" * 72)
+        lines.append("ERRORS")
+        lines.append("-" * 72)
+        for k, v in errors.items():
+            lines.append(f"  [{k}] {v}")
+        lines.append("")
+
+    lines.append("=" * 72)
+    lines.append("Disclaimer: Bukan rekomendasi investasi. Verifikasi manual wajib.")
+    lines.append("=" * 72)
+    lines.append("")
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return str(path.resolve())
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -1598,9 +2596,20 @@ if __name__ == "__main__":
     p.add_argument("ticker", help="Kode emiten")
     p.add_argument("--version", default="v2")
     p.add_argument("--model", default=None)
+    p.add_argument(
+        "--save-txt",
+        nargs="?",
+        const="",
+        default=None,
+        help="Simpan analisa ke .txt (path opsional; default folder ai_analysis_output/)",
+    )
     args = p.parse_args()
 
     out = analyze_ticker(args.ticker, args.version, model=args.model)
+    if args.save_txt is not None:
+        save_path = args.save_txt.strip() or None
+        written = save_analysis_to_txt(out, path=save_path)
+        print(f"Analisa disimpan: {written}")
     print(
         json.dumps(
             {k: v for k, v in out.items() if k != "context"},

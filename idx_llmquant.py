@@ -128,7 +128,16 @@ def _parse_macro_payload(data: dict, requested: str) -> dict[str, Any]:
     if not isinstance(previous, dict):
         previous = {}
     return {
-        "indicator": payload.get("indicator") or requested,
+        # FIX: "indicator" HARUS selalu alias yang kita minta (requested),
+        # bukan field bebas dari API. Kode lama memakai
+        # `payload.get("indicator") or requested`, sehingga kalau API
+        # membalas identitas lain (mis. series_id gaya FRED seperti
+        # "FEDFUNDS"/"DGS10"), pencocokan substring di
+        # _heuristic_macro_ihsg_conclusion ("fed_funds" in ind, "10y" in ind,
+        # dst) diam-diam gagal karena format berbeda. Label asli dari API
+        # tetap disimpan di "api_indicator_label" untuk keperluan debug/tampilan.
+        "indicator": requested,
+        "api_indicator_label": payload.get("indicator"),
         "series_id": payload.get("series_id") or payload.get("seriesId"),
         "title": payload.get("title") or requested,
         "units": payload.get("units"),
@@ -168,25 +177,42 @@ def fetch_macro_snapshot(
     for ind in indicators:
         item = None
         last_err = None
+
         # 1) alias indicator
         try:
             data = _get(path, {"indicator": ind})
-            item = _parse_macro_payload(data, ind)
-            item["query"] = f"indicator={ind}"
+            candidate = _parse_macro_payload(data, ind)
+            if candidate.get("latest_value") is not None:
+                candidate["query"] = f"indicator={ind}"
+                item = candidate
+            else:
+                # FIX (bug #1): request sukses (200 OK / JSON valid) tapi tanpa
+                # nilai — dulu ini TIDAK dianggap error sehingga fallback
+                # series_id di bawah tidak pernah kepakai. Sekarang dicatat
+                # sebagai kegagalan supaya fallback tetap dicoba.
+                last_err = f"indicator={ind}: respons sukses tapi tanpa nilai (latest_value kosong)"
         except Exception as e:
             last_err = str(e)
-            # 2) series_id FRED
+
+        # 2) fallback series_id FRED — dicoba setiap kali alias BELUM
+        # menghasilkan item yang valid, baik karena exception maupun karena
+        # respons kosong di atas.
+        if item is None:
             sid = INDICATOR_SERIES_FALLBACK.get(ind)
             if sid:
                 try:
                     data = _get(path, {"series_id": sid})
-                    item = _parse_macro_payload(data, ind)
-                    item["query"] = f"series_id={sid}"
-                    last_err = None
+                    candidate = _parse_macro_payload(data, ind)
+                    if candidate.get("latest_value") is not None:
+                        candidate["query"] = f"series_id={sid}"
+                        item = candidate
+                        last_err = None
+                    else:
+                        last_err = f"{last_err}; series_id={sid}: respons sukses tapi tanpa nilai"
                 except Exception as e2:
                     last_err = f"{last_err}; series_id={sid}: {e2}"
 
-        if item and item.get("latest_value") is not None:
+        if item is not None:
             out["items"].append(item)
         else:
             out["errors"].append(f"{ind}: {_short_err(last_err or 'no data')}")
@@ -381,6 +407,8 @@ def _heuristic_macro_ihsg_conclusion(macro: dict, regime: dict | None = None) ->
         lines.append("")
 
     bias = "netral / campuran"
+    score = 0
+    notes: list[str] = []
     for it in items:
         ind = str(it.get("indicator") or "").lower()
         d = it.get("delta_abs")
@@ -390,15 +418,35 @@ def _heuristic_macro_ihsg_conclusion(macro: dict, regime: dict | None = None) ->
             df = None
         if df is None:
             continue
+        label = it.get("title") or ind
         if "fed_funds" in ind or "yield" in ind or "10y" in ind:
             if df > 0:
-                bias = "hati-hati (tekanan yield/suku bunga naik)"
+                score -= 1
+                notes.append(f"{label}: yield/suku bunga naik → tekanan")
             elif df < 0:
-                bias = "sedikit mendukung risk-on (yield/suku bunga turun)"
+                score += 1
+                notes.append(f"{label}: yield/suku bunga turun → mendukung risk-on")
         if "unemployment" in ind and df > 0.1:
-            bias = "waspada pelemahan global (pengangguran naik)"
+            score -= 1
+            notes.append(f"{label}: pengangguran naik → waspada pelemahan global")
 
-    lines.append(f"**Implikasi singkat untuk IHSG:** bias **{bias}**.")
+    # FIX (bug #3): dulu variabel bias ditimpa (overwrite) setiap kali ada
+    # indikator yang cocok, jadi hasil akhirnya cuma mencerminkan indikator
+    # TERAKHIR di urutan DEFAULT_MACRO_INDICATORS — sinyal dari indikator
+    # lain yang sudah diproses sebelumnya hilang begitu saja meski
+    # berlawanan arah. Sekarang semua sinyal diakumulasi jadi skor bersih.
+    if score > 0:
+        bias = "sedikit mendukung risk-on"
+    elif score < 0:
+        bias = "hati-hati (tekanan yield/suku bunga/pelemahan global)"
+
+    lines.append(
+        f"**Implikasi singkat untuk IHSG:** bias **{bias}**"
+        + (f" (skor bersih {score:+d} dari {len(notes)} sinyal terdeteksi)" if notes else "")
+        + "."
+    )
+    if notes:
+        lines.append("Rincian sinyal: " + "; ".join(notes) + ".")
     lines.append(
         "Tetap utamakan struktur harga IHSG & likuiditas domestik; makro AS hanya konteks, "
         "bukan trigger entry emiten individual."
@@ -428,15 +476,19 @@ def conclude_macro_vs_ihsg(
     }
 
     payload = {
-        "macro_items": macro.get("items") or [],
+        "macro_items": (macro.get("items") or [])[:8],
         "macro_narrative": macro.get("narrative_hint"),
-        "macro_errors": macro.get("errors") or [],
+        "macro_errors": (macro.get("errors") or [])[:5],
         "ihsg_regime": regime.get("regime"),
+        "ihsg_bias": regime.get("bias"),
+        "ihsg_bias_score": regime.get("bias_score"),
         "ihsg_activity": regime.get("activity"),
         "ihsg_last_close": regime.get("last_close"),
-        "ihsg_reason": regime.get("reason") or [],
+        "ihsg_reason": (regime.get("reason") or [])[:6],
+        "ihsg_activity_reason": (regime.get("activity_reason") or [])[:4],
         "ihsg_strategies": regime.get("strategies") or [],
         "vol_ratio_20": regime.get("vol_ratio_20"),
+        "range_5_pct": regime.get("range_5_pct"),
         "range_20_pct": regime.get("range_20_pct"),
     }
 
@@ -457,7 +509,13 @@ def conclude_macro_vs_ihsg(
                 )
                 user = (
                     "Data makro + rezim IHSG (JSON):\n"
-                    + json.dumps(payload, ensure_ascii=False, default=str)[:6000]
+                    # FIX (bug #4): dulu di sini ada `[:6000]` yang memotong
+                    # STRING hasil json.dumps mentah-mentah, berisiko memotong
+                    # di tengah objek/angka sehingga JSON yang dikirim ke LLM
+                    # jadi tidak valid. Sekarang ukuran dibatasi di level data
+                    # (list di payload di atas sudah di-cap), jadi dump JSON
+                    # penuh di sini selalu valid.
+                    + json.dumps(payload, ensure_ascii=False, default=str)
                     + "\n\nTulis kesimpulan dengan heading: "
                     "1) Bacaan makro 2) Transmisi ke IHSG 3) Bias arah 4) Yang perlu diawasi."
                 )

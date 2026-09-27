@@ -402,9 +402,20 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
 
 def get_universe(params: dict) -> list:
     try:
-        from idx_gdrive_data import get_ticker_universe
+        from idx_gdrive_data import resolve_screener_universe
 
-        remote = get_ticker_universe(fallback=[])
+        def _liq():
+            if IdxLiquidityScanner is None:
+                return []
+            scanner = IdxLiquidityScanner(
+                min_avg_value_rp=params.get("min_avg_value_rp", 10_000_000_000),
+                min_avg_volume=params.get("min_avg_volume", 1_000_000),
+                lookback_days=20,
+                max_workers=15,
+            )
+            return scanner.get_liquid_universe()
+
+        remote = resolve_screener_universe(fallback_fn=_liq)
         if remote:
             return remote
     except Exception:
@@ -431,7 +442,7 @@ def get_universe(params: dict) -> list:
     ]
 
 
-def run_accumulation_screener(user_params: dict | None = None):
+def run_accumulation_screener(user_params: dict | None = None, universe=None):
     params = PARAMS.copy()
     if user_params:
         params.update(user_params)
@@ -439,7 +450,10 @@ def run_accumulation_screener(user_params: dict | None = None):
     print("=" * 60)
     print("IDX ACCUMULATION SCREENER (Late Base + Sweep Low/Spring)")
     print("=" * 60)
-    universe = get_universe(params)
+    if universe:
+        print(f"Memakai shared universe ({len(universe)} ticker) — skip scan ACC.")
+    else:
+        universe = get_universe(params)
     print(f"Analisa {len(universe)} saham...\n")
 
     rows = []

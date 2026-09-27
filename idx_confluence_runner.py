@@ -1,17 +1,21 @@
 """
 IDX CONFLUENCE RUNNER
 ============================================================
-1. Menjalankan semua strategy screener yang tersedia
-2. Membaca idx_report_* hari ini
-3. Menghitung confluence antar strategi
-4. Menampilkan Top 5 ticker dengan overlap terkuat
+1. Prefetch universe likuiditas SEKALI (cache proses)
+2. Menjalankan semua strategy screener dengan shared universe
+3. Membaca idx_report_* hari ini
+4. Menghitung confluence antar strategi
+5. Menampilkan Top N ticker dengan overlap terkuat
+
+Format output dipertahankan dari versi lama
+(N_Strategies, Strategies, TotalScore, AvgScore, AvgRR, Entries, Stops, Targets).
 """
 
 from __future__ import annotations
 
-import os
 import glob
 import importlib
+import os
 import traceback
 from collections import defaultdict
 from datetime import datetime
@@ -66,7 +70,37 @@ def find_report(version: str, today: str | None = None) -> str | None:
     return max(files, key=os.path.getmtime)
 
 
-def run_one_strategy(module_name: str, fn_name: str, label: str, params: dict) -> bool:
+def prefetch_shared_universe(params: dict | None = None) -> list[str]:
+    """
+    Scan likuiditas sekali untuk seluruh sesi confluence.
+    Hasil di-cache di idx_liquidity_scanner (TTL proses).
+    """
+    params = params or {}
+    try:
+        from idx_liquidity_scanner import get_shared_liquid_universe
+
+        print("\n[confluence] Prefetch universe likuiditas (sekali untuk semua strategi)...")
+        u = get_shared_liquid_universe(
+            min_avg_value_rp=float(params.get("min_avg_value_rp", 10_000_000_000)),
+            min_avg_volume=float(params.get("min_avg_volume", 1_000_000)),
+            lookback_days=int(params.get("lookback_days", 20)),
+            max_workers=15,
+            force_refresh=bool(params.get("force_refresh_universe", False)),
+        )
+        print(f"[confluence] Shared universe: {len(u)} ticker")
+        return list(u)
+    except Exception as e:
+        print(f"[confluence] Prefetch gagal (setiap strategi scan sendiri): {e}")
+        return []
+
+
+def run_one_strategy(
+    module_name: str,
+    fn_name: str,
+    label: str,
+    params: dict,
+    universe: list[str] | None = None,
+) -> bool:
     print("\n" + "-" * 70)
     print(f"▶ Menjalankan {label} ({module_name}.{fn_name})")
     print("-" * 70)
@@ -77,24 +111,37 @@ def run_one_strategy(module_name: str, fn_name: str, label: str, params: dict) -
             print(f"  [SKIP] Fungsi {fn_name} tidak ada.")
             return False
 
-        # Beberapa skrip pakai params / user_params / PARAMS global
+        if hasattr(mod, "PARAMS") and isinstance(mod.PARAMS, dict):
+            mod.PARAMS.update(params)
+
+        u = universe or None
+
+        # Coba signature dengan universe dulu (V2–V5, Intra, HB, ACC)
         if fn_name == "run_screener":
-            if hasattr(mod, "PARAMS") and isinstance(mod.PARAMS, dict):
-                mod.PARAMS.update(params)
-                fn(params=mod.PARAMS)
-            else:
+            p = getattr(mod, "PARAMS", params)
+            try:
+                fn(universe=u, params=p)
+            except TypeError:
                 try:
-                    fn(params=params)
+                    fn(params=p)
                 except TypeError:
                     fn(user_params=params)
         else:
+            # run_screener_v4/v5, run_intraday, run_highbeta, run_accumulation
             try:
-                fn(user_params=params)
+                fn(user_params=params, universe=u)
             except TypeError:
                 try:
-                    fn(params=params)
+                    fn(params=params, universe=u)
                 except TypeError:
-                    fn()
+                    try:
+                        fn(user_params=params)
+                    except TypeError:
+                        try:
+                            fn(params=params)
+                        except TypeError:
+                            fn()
+
         print(f"  [OK] {label} selesai.")
         return True
     except Exception as e:
@@ -139,17 +186,19 @@ def build_confluence(frames: list[pd.DataFrame], top_n: int = 5) -> pd.DataFrame
     """
     Confluence = ticker muncul di >= 2 strategi.
     Rank: jumlah strategi ↓, total score ↓, avg RR ↓.
+
+    Format kolom (versi lama, dipertahankan):
+      Ticker, N_Strategies, Strategies, TotalScore, AvgScore, AvgRR,
+      Close, Entries, Stops, Targets
     """
     if not frames:
         return pd.DataFrame()
 
-    # ticker → list record per strategy
     bucket: dict[str, list[dict]] = defaultdict(list)
 
     for df in frames:
         if df.empty:
             continue
-        # 1 baris per ticker per strategy
         sub = df.drop_duplicates(subset=["Ticker"], keep="first")
         for _, row in sub.iterrows():
             t = row["Ticker"]
@@ -158,10 +207,20 @@ def build_confluence(frames: list[pd.DataFrame], top_n: int = 5) -> pd.DataFrame
                     "strategy": row["_strategy"],
                     "version": row["_version"],
                     "score": _pick_score(row),
-                    "rr": float(row["RR_Ratio"]) if "RR_Ratio" in row and pd.notna(row["RR_Ratio"]) else None,
+                    "rr": (
+                        float(row["RR_Ratio"])
+                        if "RR_Ratio" in row and pd.notna(row["RR_Ratio"])
+                        else None
+                    ),
                     "entry": row.get("Entry", row.get("Close")),
                     "sl": row.get("StopLoss"),
-                    "target": row.get("Target(Liquidity)", row.get("Target(Peak)", row.get("Target"))),
+                    "target": row.get(
+                        "Target(Liquidity)",
+                        row.get(
+                            "Target1(Peak)",
+                            row.get("Target1", row.get("Target(Peak)", row.get("Target"))),
+                        ),
+                    ),
                     "close": row.get("Close"),
                 }
             )
@@ -170,7 +229,7 @@ def build_confluence(frames: list[pd.DataFrame], top_n: int = 5) -> pd.DataFrame
     for ticker, items in bucket.items():
         n = len(items)
         if n < 2:
-            continue  # butuh minimal 2 strategi
+            continue
         strategies = sorted({x["strategy"] for x in items})
         scores = [x["score"] for x in items]
         rrs = [x["rr"] for x in items if x["rr"] is not None]
@@ -184,13 +243,19 @@ def build_confluence(frames: list[pd.DataFrame], top_n: int = 5) -> pd.DataFrame
                 "AvgRR": round(sum(rrs) / len(rrs), 2) if rrs else None,
                 "Close": items[0].get("close"),
                 "Entries": ", ".join(
-                    f"{x['strategy']}:{x['entry']}" for x in items if x.get("entry") is not None
+                    f"{x['strategy']}:{x['entry']}"
+                    for x in items
+                    if x.get("entry") is not None
                 ),
                 "Stops": ", ".join(
-                    f"{x['strategy']}:{x['sl']}" for x in items if x.get("sl") is not None
+                    f"{x['strategy']}:{x['sl']}"
+                    for x in items
+                    if x.get("sl") is not None
                 ),
                 "Targets": ", ".join(
-                    f"{x['strategy']}:{x['target']}" for x in items if x.get("target") is not None
+                    f"{x['strategy']}:{x['target']}"
+                    for x in items
+                    if x.get("target") is not None
                 ),
             }
         )
@@ -225,12 +290,20 @@ def run_confluence(
     print(f"IDX CONFLUENCE RUNNER — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("=" * 70)
 
-    # 1) Jalankan semua strategy
+    # 1) Prefetch universe + jalankan semua strategy
+    shared_universe: list[str] = []
     if not skip_run:
+        shared_universe = prefetch_shared_universe(p)
         for mod_name, fn_name, ver, label in STRATEGIES:
             if only_versions and ver not in only_versions:
                 continue
-            run_one_strategy(mod_name, fn_name, label, p)
+            run_one_strategy(
+                mod_name,
+                fn_name,
+                label,
+                p,
+                universe=shared_universe or None,
+            )
     else:
         print("(skip_run=True — tidak menjalankan ulang screener)")
 
@@ -264,7 +337,13 @@ def run_confluence(
     print("=" * 70)
 
     out_name = f"idx_report_confluence_{today}.csv"
-    top.to_csv(out_name, index=False)
+    try:
+        from idx_report_schema import save_version_report
+
+        path = save_version_report(top, "confluence")
+        out_name = path
+    except Exception:
+        top.to_csv(out_name, index=False)
     print(f"Disimpan: {out_name}")
     return top
 
@@ -273,7 +352,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="IDX Confluence Runner")
-    parser.add_argument("--skip-run", action="store_true", help="Hanya baca CSV existing")
+    parser.add_argument(
+        "--skip-run", action="store_true", help="Hanya baca CSV existing"
+    )
     parser.add_argument("--top", type=int, default=5, help="Jumlah ticker top confluence")
     parser.add_argument("--modal", type=float, default=50_000_000)
     parser.add_argument("--risk", type=float, default=1.0)

@@ -1,19 +1,120 @@
 """
-IDX BREAKOUT SCREENER + POSITION PLAN — v2
+IDX BREAKOUT SCREENER + POSITION PLAN — v2 (engine-enriched)
 ============================================================
-+ Filter false breakout:
+Filter false breakout:
   1) Liquidity sweep di resistance sebelumnya
   2) Momentum masih mendukung real breakout
+
+Enrichment dari Trading Engine:
+  - SL: gabungan struktur + buffer ATR (min jarak)
+  - Volume ratio harian vs MA20
+  - Setup BREAKOUT | RETEST
+  - Skor ranking (sweep, volume, trend, RR)
+  - Lots + net PnL setelah fee beli/jual
 """
 
 from __future__ import annotations
+
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
-from datetime import datetime
+
 from idx_liquidity_scanner import IdxLiquidityScanner
+
+# =========================================================================
+# PARAMS
+# =========================================================================
+PARAMS = {
+    "min_avg_value_traded": 10_000_000_000,
+    "min_avg_value_rp": 10_000_000_000,  # alias scanner
+    "min_avg_volume": 1_000_000,
+    "lookback_days": 150,
+    "consolidation_window": 20,
+    "swing_lookback": 60,
+    "fractal_bars": 2,
+    "atr_period": 14,
+    "max_range_pct": 8.0,
+    "near_high_pct": 3.0,
+    "volume_surge_ratio": 1.2,
+    "rsi_min": 50,
+    "rsi_max": 70,
+    "top_n": 20,
+    "min_score": 40,
+    "entry_buffer_pct": 0.5,
+    "stop_buffer_pct": 0.5,
+    "atr_stop_mult": 1.5,  # jarak SL minimal ~ ATR * mult dari entry
+    "atr_sl_buffer": 0.50,  # buffer di bawah level struktur (× ATR)
+    "min_risk_reward": 1.5,
+    "tp1_r": 1.5,
+    "tp2_r": 2.5,
+    "account_size": 5_000_000,
+    "risk_per_trade_pct": 1.0,
+    "lot_size": 100,
+    # Fee broker (fraksi, bukan %)
+    "buy_fee": 0.0015,
+    "sell_fee": 0.0025,
+    # False breakout filter
+    "require_liquidity_sweep": False,
+    "sweep_lookback": 12,
+    "sweep_min_wick_pct": 0.25,
+    "min_breakout_vol_ratio": 1.25,
+    "min_body_pct": 0.35,
+    "rsi_max_momentum": 72,
+    # Retest
+    "enable_retest_setup": True,
+    "retest_atr_tolerance": 0.50,
+    "retest_lookback": 5,
+    # Volume bar terakhir vs MA20
+    "min_last_vol_ratio": 1.20,
+}
+
+
+# =========================================================================
+# UTILITAS BEI
+# =========================================================================
+def round_to_idx_tick(price: float) -> int:
+    if pd.isna(price) or price <= 0:
+        return 0
+    price = float(price)
+    if price < 50:
+        return int(round(price))
+    price = int(round(price, 0))
+    if price < 200:
+        return price
+    if price < 500:
+        return int(round(price / 2.0) * 2)
+    if price < 2000:
+        return int(round(price / 5.0) * 5)
+    if price < 5000:
+        return int(round(price / 10.0) * 10)
+    return int(round(price / 25.0) * 25)
+
+
+def apply_ara_arb_limits(price: float, prev_close: float, is_target: bool) -> float:
+    if prev_close < 200:
+        limit = 0.35
+    elif prev_close <= 5000:
+        limit = 0.25
+    else:
+        limit = 0.20
+    ara = round_to_idx_tick(prev_close * (1 + limit))
+    arb = round_to_idx_tick(prev_close * (1 - limit))
+    return min(price, ara) if is_target else max(price, arb)
+
+
+def trade_net_pnl(entry: float, exit_price: float, shares: int, params: dict) -> float:
+    """PnL bersih setelah fee beli + jual."""
+    if shares <= 0 or entry <= 0:
+        return 0.0
+    buy_fee = float(params.get("buy_fee", 0.0015))
+    sell_fee = float(params.get("sell_fee", 0.0025))
+    cost = entry * shares * (1 + buy_fee)
+    proceeds = exit_price * shares * (1 - sell_fee)
+    return round(proceeds - cost, 0)
+
 
 # =========================================================================
 # UNIVERSE
@@ -45,89 +146,29 @@ def get_lq45_universe() -> list:
 
 
 def get_dynamic_liquidity_universe(params: dict) -> list:
-    print("=" * 60)
-    print("TAHAP 1: PRE-SCREENER (MEMINDAI SELURUH PASAR)")
-    print("=" * 60)
-    scanner = IdxLiquidityScanner(
-        min_avg_value_rp=params.get("min_avg_value_traded", 10_000_000_000),
-        min_avg_volume=params.get("min_avg_volume", 1_000_000),
-        lookback_days=20,
-        max_workers=15,
-    )
-    liquid_universe = scanner.get_liquid_universe()
-    print("=" * 60)
-    print("TAHAP 2: DEEP TECHNICAL ANALYSIS (BREAKOUT V2 + SWEEP FILTER)")
-    print("=" * 60)
-    return liquid_universe
+    def _liq():
+        scanner = IdxLiquidityScanner(
+            min_avg_value_rp=params.get(
+                "min_avg_value_rp", params.get("min_avg_value_traded", 10_000_000_000)
+            ),
+            min_avg_volume=params.get("min_avg_volume", 1_000_000),
+            lookback_days=min(int(params.get("lookback_days", 20)), 30),
+            max_workers=15,
+        )
+        return scanner.get_liquid_universe()
 
+    try:
+        from idx_gdrive_data import resolve_screener_universe
 
-# =========================================================================
-# PARAMETER
-# =========================================================================
-PARAMS = {
-    "min_avg_value_traded": 10_000_000_000,
-    "min_avg_volume": 1_000_000,
-    "lookback_days": 150,
-    "consolidation_window": 20,
-    "swing_lookback": 60,
-    "fractal_bars": 2,
-    "atr_period": 14,
-    "max_range_pct": 8.0,
-    "near_high_pct": 3.0,
-    "volume_surge_ratio": 1.2,
-    "rsi_min": 50,
-    "rsi_max": 70,
-    "top_n": 20,
-    "min_score": 40,
-    "entry_buffer_pct": 0.5,
-    "stop_buffer_pct": 0.5,
-    "atr_stop_mult": 1.5,
-    "min_risk_reward": 1.5,
-    "account_size": 5_000_000,
-    "risk_per_trade_pct": 1.0,
-    "lot_size": 100,
-    # --- False breakout filter ---
-    "require_liquidity_sweep": False,   # True = wajib ada sweep di res
-    "sweep_lookback": 12,              # cari sweep dalam N hari
-    "sweep_min_wick_pct": 0.25,        # minimal wick di atas res (%)
-    "min_breakout_vol_ratio": 1.25,    # volume untuk momentum BO
-    "min_body_pct": 0.35,              # body candle vs harga (%)
-    "rsi_max_momentum": 72,            # di atas ini rawan false BO
-}
-
-
-# =========================================================================
-# UTILITAS BEI
-# =========================================================================
-def round_to_idx_tick(price: float) -> int:
-    if pd.isna(price) or price <= 0:
-        return 0
-    price = float(price)
-    if price < 50:
-        return int(round(price))
-    price = int(round(price, 0))
-    if price < 200:
-        return price
-    elif price < 500:
-        return int(round(price / 2.0) * 2)
-    elif price < 2000:
-        return int(round(price / 5.0) * 5)
-    elif price < 5000:
-        return int(round(price / 10.0) * 10)
-    else:
-        return int(round(price / 25.0) * 25)
-
-
-def apply_ara_arb_limits(price: float, prev_close: float, is_target: bool) -> float:
-    if prev_close < 200:
-        limit = 0.35
-    elif prev_close <= 5000:
-        limit = 0.25
-    else:
-        limit = 0.20
-    ara = round_to_idx_tick(prev_close * (1 + limit))
-    arb = round_to_idx_tick(prev_close * (1 - limit))
-    return min(price, ara) if is_target else max(price, arb)
+        u = resolve_screener_universe(fallback_fn=_liq)
+        if u:
+            return u
+    except Exception:
+        pass
+    try:
+        return _liq()
+    except Exception:
+        return get_lq45_universe()
 
 
 # =========================================================================
@@ -179,7 +220,7 @@ def find_swing_points(df: pd.DataFrame, lookback: int, n_bars: int):
 
 
 # =========================================================================
-# FALSE BREAKOUT FILTER: LIQUIDITY SWEEP + MOMENTUM
+# FALSE BREAKOUT FILTER + RETEST
 # =========================================================================
 def detect_liquidity_sweep(
     df: pd.DataFrame,
@@ -187,14 +228,10 @@ def detect_liquidity_sweep(
     lookback: int = 12,
     min_wick_pct: float = 0.25,
 ) -> dict:
-    """
-    Sweep di resistance = High tembus res, Close kembali <= res
-    (stop-hunt / liquidity grab) dalam lookback bar, sebelum bar terakhir.
-    """
+    """Sweep di resistance: High tembus res, Close kembali <= res."""
     if resistance <= 0 or len(df) < lookback + 2:
         return {"has_sweep": False, "sweep_high": 0.0, "wick_pct": 0.0}
 
-    # bar -lookback … -2 (hari ini dipakai untuk sinyal BO)
     start = max(0, len(df) - lookback - 1)
     end = len(df) - 1
     for i in range(end - 1, start - 1, -1):
@@ -213,14 +250,62 @@ def detect_liquidity_sweep(
     return {"has_sweep": False, "sweep_high": 0.0, "wick_pct": 0.0}
 
 
+def detect_retest_setup(
+    df: pd.DataFrame,
+    resistance: float,
+    atr: float,
+    params: dict,
+) -> dict:
+    """
+    RETEST: dalam lookback bar, pernah close di atas resistance,
+    low hari ini mendekati level, close hold di atas.
+    """
+    out = {"is_retest": False, "bars_since_break": None}
+    if resistance <= 0 or len(df) < 3 or atr <= 0:
+        return out
+    if not params.get("enable_retest_setup", True):
+        return out
+
+    lookback = int(params.get("retest_lookback", 5))
+    tol = float(params.get("retest_atr_tolerance", 0.5)) * atr
+    last = df.iloc[-1]
+    close = float(last["Close"])
+    low = float(last["Low"])
+
+    if close < resistance * 0.998:
+        return out
+    if abs(low - resistance) > tol and low > resistance + tol:
+        # tidak menyentuh zona retest
+        if low > resistance + tol:
+            return out
+
+    # cari breakout sebelumnya
+    start = max(0, len(df) - lookback - 1)
+    end = len(df) - 1
+    broke = False
+    bars_since = None
+    for i in range(end - 1, start - 1, -1):
+        if float(df["Close"].iloc[i]) > resistance:
+            broke = True
+            bars_since = end - i
+            break
+    if not broke:
+        return out
+
+    near = abs(low - resistance) <= tol or (low <= resistance * 1.005 and close >= resistance)
+    if near and close >= resistance:
+        return {"is_retest": True, "bars_since_break": bars_since}
+    return out
+
+
 def breakout_momentum_ok(
     df: pd.DataFrame,
     resistance: float,
     vol_ratio: float,
+    last_vol_ratio: float,
     rsi: float,
     params: dict,
 ) -> tuple[bool, list[str]]:
-    """Momentum masih mengarah ke real breakout, bukan spike palsu."""
     notes = []
     last = df.iloc[-1]
     prev = df.iloc[-2]
@@ -232,7 +317,6 @@ def breakout_momentum_ok(
 
     ok = True
 
-    # Dekat resistance
     dist = (resistance - close) / close * 100
     if dist > params.get("near_high_pct", 3.0):
         ok = False
@@ -240,15 +324,19 @@ def breakout_momentum_ok(
     else:
         notes.append(f"Dekat res ({dist:.1f}%)")
 
-    # Volume
     min_vol = params.get("min_breakout_vol_ratio", 1.25)
     if vol_ratio >= min_vol:
-        notes.append(f"Vol {vol_ratio:.2f}x")
+        notes.append(f"Vol5 {vol_ratio:.2f}x")
     else:
         ok = False
-        notes.append(f"Vol lemah {vol_ratio:.2f}x")
+        notes.append(f"Vol5 lemah {vol_ratio:.2f}x")
 
-    # RSI
+    min_last = params.get("min_last_vol_ratio", 1.20)
+    if last_vol_ratio >= min_last:
+        notes.append(f"Vol1 {last_vol_ratio:.2f}x")
+    else:
+        notes.append(f"Vol1 rendah {last_vol_ratio:.2f}x")
+
     rsi_max = params.get("rsi_max_momentum", 72)
     if params.get("rsi_min", 50) <= rsi <= rsi_max:
         notes.append(f"RSI {rsi:.0f}")
@@ -258,7 +346,6 @@ def breakout_momentum_ok(
     else:
         notes.append(f"RSI {rsi:.0f}")
 
-    # Struktur candle
     if body_pct >= params.get("min_body_pct", 0.35) and close >= open_:
         notes.append("Body bullish")
     elif close >= resistance * 0.998:
@@ -266,13 +353,11 @@ def breakout_momentum_ok(
     else:
         notes.append("Pre-BO")
 
-    # Higher / equal low
     if float(last["Low"]) >= float(prev["Low"]) * 0.995:
         notes.append("HL/EL")
     else:
         notes.append("Low melemah")
 
-    # Hindari wick atas ekstrem hari ini tanpa close kuat (fake spike)
     day_range = max(high - low, 1e-9)
     upper_wick = high - max(close, open_)
     if upper_wick / day_range > 0.55 and close < resistance:
@@ -283,9 +368,17 @@ def breakout_momentum_ok(
 
 
 # =========================================================================
-# POSITION PLAN
+# POSITION PLAN (ATR + fee)
 # =========================================================================
-def build_position_plan(last_close, swing_highs, swing_lows, atr, recent_high, recent_low, params):
+def build_position_plan(
+    last_close,
+    swing_highs,
+    swing_lows,
+    atr,
+    recent_high,
+    recent_low,
+    params,
+):
     res_candidates = [h for h in swing_highs if h > last_close] or [recent_high]
     resistance = min(res_candidates) if res_candidates else recent_high
     res_candidates_far = [h for h in res_candidates if h > resistance]
@@ -302,13 +395,17 @@ def build_position_plan(last_close, swing_highs, swing_lows, atr, recent_high, r
 
     entry = round_to_idx_tick(resistance * (1 + params["entry_buffer_pct"] / 100))
 
+    # SL struktur
     stop_by_support = support * (1 - params["stop_buffer_pct"] / 100)
-    stop_by_atr = (
-        entry - (atr * params["atr_stop_mult"])
-        if not np.isnan(atr) and atr > 0
-        else stop_by_support
-    )
-    stop_loss = min(stop_by_support, stop_by_atr)
+    # SL di bawah resistance (level BO) − buffer ATR
+    if not np.isnan(atr) and atr > 0:
+        stop_by_level = resistance - params.get("atr_sl_buffer", 0.5) * atr
+        stop_by_atr_entry = entry - (atr * params["atr_stop_mult"])
+        # Ambil yang lebih rendah (lebih longgar / aman), tapi jangan di atas entry
+        stop_loss = min(stop_by_support, stop_by_level, stop_by_atr_entry)
+    else:
+        stop_loss = stop_by_support
+
     if stop_loss >= entry:
         stop_loss = entry * 0.97
     stop_loss = apply_ara_arb_limits(round_to_idx_tick(stop_loss), last_close, is_target=False)
@@ -317,11 +414,14 @@ def build_position_plan(last_close, swing_highs, swing_lows, atr, recent_high, r
     if risk_per_share <= 0:
         return None
 
+    tp1_r = float(params.get("tp1_r", 1.5))
+    tp2_r = float(params.get("tp2_r", 2.5))
+    # Target minimal 2R lama diganti R dari engine; tetap max dengan resistance_2
     target_1 = apply_ara_arb_limits(
-        round_to_idx_tick(entry + risk_per_share * 2), last_close, is_target=True
+        round_to_idx_tick(entry + risk_per_share * tp1_r), last_close, is_target=True
     )
     target_2 = apply_ara_arb_limits(
-        round_to_idx_tick(max(resistance_2, entry + risk_per_share * 3)),
+        round_to_idx_tick(max(resistance_2, entry + risk_per_share * tp2_r)),
         last_close,
         is_target=True,
     )
@@ -334,6 +434,10 @@ def build_position_plan(last_close, swing_highs, swing_lows, atr, recent_high, r
     lots = int((risk_rp / risk_per_share) // params["lot_size"]) if risk_per_share > 0 else 0
     shares = lots * params["lot_size"]
 
+    net_sl = trade_net_pnl(entry, stop_loss, shares, params)
+    net_tp1 = trade_net_pnl(entry, target_1, shares, params)
+    net_tp2 = trade_net_pnl(entry, target_2, shares, params)
+
     return {
         "Support": round_to_idx_tick(support),
         "Resistance": round_to_idx_tick(resistance),
@@ -344,23 +448,64 @@ def build_position_plan(last_close, swing_highs, swing_lows, atr, recent_high, r
         "Target1": target_1,
         "Target2": target_2,
         "ATR": round(atr, 0) if not np.isnan(atr) else 0,
-        "RiskPerShare": risk_per_share,
+        "RiskPerShare": round(risk_per_share, 2),
         "RR_Ratio": round(rr_ratio, 2),
+        "RR_TP2": round((target_2 - entry) / risk_per_share, 2) if risk_per_share > 0 else 0,
         "LayakRR": rr_ratio >= params["min_risk_reward"],
         "SuggestedLots": lots,
         "SuggestedShares": shares,
         "EstCapitalUsed(Rp)": round(shares * entry, 0),
         "EstLoss(Rp)": round(shares * risk_per_share, 0),
         "EstProfit1(Rp)": round(shares * reward_1, 0),
+        "NetPnL_SL": net_sl,
+        "NetPnL_TP1": net_tp1,
+        "NetPnL_TP2": net_tp2,
         "Confluence": "; ".join(confluence_notes) if confluence_notes else "-",
     }
+
+
+def compute_setup_score(
+    *,
+    base_score: int,
+    sweep: dict,
+    vol_ratio: float,
+    last_vol_ratio: float,
+    rsi: float,
+    above_ma20: bool,
+    ma20_above_ma50: bool,
+    rr_ratio: float,
+    is_retest: bool,
+    params: dict,
+) -> int:
+    """Skor ranking 0–100 (engine-style components)."""
+    score = float(base_score)
+    if sweep.get("has_sweep"):
+        score += 10  # base analyze sudah +15 di reasons path; cap later
+    if vol_ratio >= params.get("volume_surge_ratio", 1.2):
+        score += 5
+    if last_vol_ratio >= 1.5:
+        score += 8
+    elif last_vol_ratio >= 1.2:
+        score += 4
+    if above_ma20 and ma20_above_ma50:
+        score += 5
+    if 50 <= rsi <= 70:
+        score += 5
+    if rr_ratio >= params.get("min_risk_reward", 1.5):
+        score += 10
+    elif rr_ratio >= 1.2:
+        score += 4
+    if is_retest:
+        score += 8
+    return int(min(100, round(score)))
 
 
 # =========================================================================
 # ANALISA TICKER
 # =========================================================================
 def analyze_ticker(symbol: str, params: dict) -> dict | None:
-    ticker = symbol + ".JK"
+    ticker = symbol.replace(".JK", "") + ".JK"
+    sym = symbol.replace(".JK", "").upper()
     try:
         df = yf.download(
             ticker,
@@ -369,6 +514,7 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
             progress=False,
             auto_adjust=True,
             multi_level_index=False,
+            threads=False,
         )
     except Exception:
         return None
@@ -420,13 +566,18 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
 
     vol_5d_avg = float(volume.tail(5).mean())
     vol_ratio = vol_5d_avg / avg_volume_20 if avg_volume_20 > 0 else 0
+    last_vol_ratio = (
+        float(volume.iloc[-1]) / avg_volume_20 if avg_volume_20 > 0 else 0
+    )
 
     rsi_val = compute_rsi(close).iloc[-1]
     rsi = float(rsi_val) if not pd.isna(rsi_val) else 50.0
 
     bb_width = compute_bb_width(close)
     bb_width_now = float(bb_width.iloc[-1]) if not pd.isna(bb_width.iloc[-1]) else 0
-    bb_width_avg = float(bb_width.tail(60).mean()) if not pd.isna(bb_width.tail(60).mean()) else 0
+    bb_width_avg = (
+        float(bb_width.tail(60).mean()) if not pd.isna(bb_width.tail(60).mean()) else 0
+    )
     is_squeeze = bb_width_now < bb_width_avg if bb_width_avg > 0 else False
 
     atr_val = compute_atr(df, params["atr_period"]).iloc[-1]
@@ -435,7 +586,6 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         df, params["swing_lookback"], params["fractal_bars"]
     )
 
-    # --- Scoring dasar ---
     score = 0
     reasons = []
 
@@ -452,8 +602,11 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         score += 10
         reasons.append("Close>MA20")
     if vol_ratio >= params["volume_surge_ratio"]:
-        score += 20
+        score += 15
         reasons.append(f"Volume naik ({vol_ratio:.2f}x)")
+    if last_vol_ratio >= params.get("min_last_vol_ratio", 1.2):
+        score += 5
+        reasons.append(f"Vol hari ini {last_vol_ratio:.2f}x")
     if params["rsi_min"] <= rsi <= params["rsi_max"]:
         score += 10
         reasons.append(f"RSI sehat ({rsi:.0f})")
@@ -472,7 +625,6 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
 
     resistance = float(plan["Resistance"])
 
-    # --- [BARU] Liquidity sweep ---
     sweep = detect_liquidity_sweep(
         df,
         resistance=resistance,
@@ -482,10 +634,14 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     if params.get("require_liquidity_sweep", True) and not sweep["has_sweep"]:
         return None
 
-    # --- [BARU] Momentum real breakout ---
-    mom_ok, mom_notes = breakout_momentum_ok(df, resistance, vol_ratio, rsi, params)
+    mom_ok, mom_notes = breakout_momentum_ok(
+        df, resistance, vol_ratio, last_vol_ratio, rsi, params
+    )
     if not mom_ok:
         return None
+
+    retest = detect_retest_setup(df, resistance, atr, params)
+    setup_type = "RETEST" if retest.get("is_retest") else "BREAKOUT"
 
     if sweep["has_sweep"]:
         score += 15
@@ -493,17 +649,36 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
             f"Liquidity sweep (wick {sweep.get('wick_pct', 0)}%, "
             f"{sweep.get('bars_ago', '?')} bar lalu)"
         )
+    if retest.get("is_retest"):
+        reasons.append(f"Retest hold (break {retest.get('bars_since_break')} bar lalu)")
     for n in mom_notes:
         if n not in reasons:
             reasons.append(n)
 
+    score = compute_setup_score(
+        base_score=score,
+        sweep=sweep,
+        vol_ratio=vol_ratio,
+        last_vol_ratio=last_vol_ratio,
+        rsi=rsi,
+        above_ma20=above_ma20,
+        ma20_above_ma50=ma20_above_ma50,
+        rr_ratio=float(plan["RR_Ratio"]),
+        is_retest=bool(retest.get("is_retest")),
+        params=params,
+    )
+
     result = {
-        "Ticker": symbol,
+        "Ticker": sym,
+        "SetupType": setup_type,
         "Close": round_to_idx_tick(last_close),
         "AvgValue20D(Rp Jt)": round(avg_value_20 / 1_000_000, 0),
         "RangePct": round(range_pct, 1),
         "VolRatio5v20": round(vol_ratio, 2),
+        "VolRatio1v20": round(last_vol_ratio, 2),
         "RSI": round(rsi, 0),
+        "MA20": round_to_idx_tick(ma20),
+        "AboveMA20": "Ya" if above_ma20 else "Tidak",
         "Squeeze": is_squeeze,
         "Score": score,
         "Alasan": "; ".join(reasons) if reasons else "-",
@@ -511,6 +686,7 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         "SweepHigh": round_to_idx_tick(sweep.get("sweep_high", 0)),
         "SweepWickPct": sweep.get("wick_pct", 0),
         "MomentumOK": "Ya" if mom_ok else "Tidak",
+        "Retest": "Ya" if retest.get("is_retest") else "Tidak",
     }
     result.update(plan)
     return result
@@ -520,10 +696,15 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
 # RUNNER
 # =========================================================================
 def run_screener(universe=None, params=None):
-    params = params or PARAMS.copy()
+    params = {**PARAMS, **(params or {})}
     universe = universe or get_dynamic_liquidity_universe(params)
+    # normalisasi ticker tanpa .JK
+    universe = [str(t).upper().replace(".JK", "").strip() for t in universe]
 
-    print(f"Menjalankan screener V2 (Breakout + Sweep Filter) untuk {len(universe)} saham...\n")
+    print(
+        f"Menjalankan screener V2 (Breakout+Sweep+Retest, engine-enriched) "
+        f"untuk {len(universe)} saham...\n"
+    )
     results = []
     for i, sym in enumerate(universe, 1):
         print(f"  [{i}/{len(universe)}] Cek {sym}...", end="\r")
@@ -540,36 +721,69 @@ def run_screener(universe=None, params=None):
         print("Tidak ada saham yang lolos filter breakout + liquidity sweep hari ini.")
         return pd.DataFrame()
 
-    df_result = pd.DataFrame(results).sort_values("Score", ascending=False)
+    df_result = pd.DataFrame(results).sort_values(
+        ["Score", "RR_Ratio"], ascending=[False, False]
+    )
     df_result = df_result.head(params["top_n"]).reset_index(drop=True)
 
     summary_cols = [
-        "Ticker", "Close", "Score", "Sweep", "RSI", "VolRatio5v20",
-        "Support", "Resistance", "EntryBreakout", "StopLoss",
-        "Target1", "RR_Ratio", "SuggestedLots",
+        "Ticker",
+        "SetupType",
+        "Close",
+        "Score",
+        "Sweep",
+        "Retest",
+        "RSI",
+        "VolRatio1v20",
+        "Support",
+        "Resistance",
+        "EntryBreakout",
+        "StopLoss",
+        "Target1",
+        "RR_Ratio",
+        "SuggestedLots",
+        "NetPnL_TP1",
+        "NetPnL_SL",
     ]
     summary_cols = [c for c in summary_cols if c in df_result.columns]
 
     print("=" * 120)
-    print(f"IDX BREAKOUT SCREENER V2 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(
+        f"IDX BREAKOUT SCREENER V2 (enriched) — "
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    )
     print("=" * 120)
     print(df_result[summary_cols].to_string(index=False))
     print("=" * 120)
 
-    print("\nRENCANA POSISI — TOP 5\n")
+    print("\nRENCANA POSISI — TOP 5 (net PnL setelah fee)\n")
     for _, row in df_result.head(5).iterrows():
         rr_flag = "OK" if row["LayakRR"] else "RR KURANG"
-        print(f"--- {row['Ticker']} (Score: {row['Score']}) Sweep={row.get('Sweep')} ---")
+        print(
+            f"--- {row['Ticker']} [{row.get('SetupType')}] "
+            f"Score={row['Score']} Sweep={row.get('Sweep')} ---"
+        )
         print(f"  Alasan : {row['Alasan']}")
         print(f"  S/R    : {row['Support']:.0f} / {row['Resistance']:.0f}")
-        print(f"  Entry  : BO {row['EntryBreakout']:.0f} | Retest {row['EntryRetest']:.0f}")
-        print(f"  SL/TP1 : {row['StopLoss']:.0f} / {row['Target1']:.0f} | RR 1:{row['RR_Ratio']:.2f} [{rr_flag}]")
-        print(f"  Lots   : {row['SuggestedLots']}")
+        print(
+            f"  Entry  : BO {row['EntryBreakout']:.0f} | "
+            f"Retest {row['EntryRetest']:.0f}"
+        )
+        print(
+            f"  SL/TP1 : {row['StopLoss']:.0f} / {row['Target1']:.0f} | "
+            f"RR 1:{row['RR_Ratio']:.2f} [{rr_flag}]"
+        )
+        print(
+            f"  Lots   : {row['SuggestedLots']} | "
+            f"Net SL {row.get('NetPnL_SL', 0):,.0f} | "
+            f"Net TP1 {row.get('NetPnL_TP1', 0):,.0f}"
+        )
         print()
 
-    df_result["Strategy"] = "V2 (Breakout)"
+    df_result["Strategy"] = "V2 (Breakout+Retest)"
     try:
         from idx_report_schema import save_version_report
+
         out_file = save_version_report(df_result, "v2")
     except ImportError:
         out_file = f"idx_report_v2_{datetime.now().strftime('%Y-%m-%d')}.csv"

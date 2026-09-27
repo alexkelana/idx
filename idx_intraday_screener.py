@@ -2,65 +2,52 @@
 IDX INTRADAY SCREENER — Confluence Ketat (Teknikal + Fundamental Ringan)
 ========================================================================
 Tujuan: kandidat day trade (bukan swing).
-- Universe likuid
-- Confluence teknikal (trend mikro, volume, jarak ke level, volatilitas)
-- Filter fundamental ringan (hindari PER ekstrem / rugi berat bila data ada)
-- Target & SL dalam jangkauan 1 sesi (konservatif)
-- Tick size + ARA/ARB BEI
-- RR minimum realistis untuk intraday (default 1.5)
 
+[Update] run_intraday_screener(..., universe=) — pakai shared cache dari confluence/master.
 Disclaimer: alat bantu screening, bukan saran investasi.
-Data harian yfinance = kandidat untuk eksekusi intraday (konfirmasi order book wajib).
 """
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from datetime import datetime
 
 try:
     from idx_liquidity_scanner import IdxLiquidityScanner
 except ImportError:
     IdxLiquidityScanner = None
 
-# =========================================================================
-# PARAMETER INTRADAY
-# =========================================================================
 PARAMS = {
     "lookback_days": 60,
-    "min_avg_value_rp": 15_000_000_000,  # lebih ketat dari swing
+    "min_avg_value_rp": 15_000_000_000,
     "min_avg_volume": 2_000_000,
-    "min_price": 100,                   # hindari tick terlalu kasar / noise
+    "min_price": 100,
     "max_price": 10000,
-    # Teknikal
-    "max_dist_to_high_pct": 2.5,        # dekat resistance / breakout zone
-    "max_range_20_pct": 12.0,           # jangan terlalu wild
-    "min_vol_ratio": 1.3,               # volume 5d vs 20d
+    "max_dist_to_high_pct": 2.5,
+    "max_range_20_pct": 12.0,
+    "min_vol_ratio": 1.3,
     "rsi_min": 45,
-    "rsi_max": 68,                      # hindari chase overbought
+    "rsi_max": 68,
     "min_score": 55,
-    # Risk intraday (ketat)
-    "sl_atr_mult": 0.6,                 # SL ~ 0.6 x ATR14
-    "sl_max_pct": 1.8,                  # SL maks % dari entry
-    "tp_atr_mult": 1.1,                 # TP ~ 1.1 x ATR
-    "tp_max_pct": 3.0,                  # TP maks % (realistis 1 hari)
+    "sl_atr_mult": 0.6,
+    "sl_max_pct": 1.8,
+    "tp_atr_mult": 1.1,
+    "tp_max_pct": 3.0,
     "min_rr": 1.5,
     "account_size": 50_000_000,
-    "risk_per_trade_pct": 0.5,          # lebih kecil dari swing
+    "risk_per_trade_pct": 0.5,
     "lot_size": 100,
     "top_n": 15,
-    # Fundamental ringan (opsional; skip jika data kosong)
     "max_pe": 40,
     "min_pe": 0,
     "max_pb": 8,
-    "require_fundamental": False,       # True = lebih ketat, hasil lebih sedikit
+    "require_fundamental": False,
 }
 
-# =========================================================================
-# UTILITAS BEI
-# =========================================================================
+
 def round_to_idx_tick(price: float) -> int:
     if pd.isna(price) or price <= 0:
         return 0
@@ -80,7 +67,6 @@ def round_to_idx_tick(price: float) -> int:
 
 
 def apply_ara_arb_limits(price: float, prev_close: float, is_target: bool) -> float:
-    """ARA/ARB BEI (pendekatan retail umum)."""
     if prev_close < 200:
         limit = 0.35
     elif prev_close <= 5000:
@@ -110,7 +96,6 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def get_fundamental_light(symbol: str) -> dict:
-    """PER/PBV/ROE ringan dari yfinance; kosongkan jika gagal."""
     out = {"PE": None, "PB": None, "ROE": None, "FundOK": True, "FundNote": "-"}
     try:
         info = yf.Ticker(symbol + ".JK").info or {}
@@ -122,7 +107,9 @@ def get_fundamental_light(symbol: str) -> dict:
         if pb is not None:
             out["PB"] = round(float(pb), 2)
         if roe is not None:
-            out["ROE"] = round(float(roe) * 100, 2) if abs(float(roe)) <= 5 else round(float(roe), 2)
+            out["ROE"] = (
+                round(float(roe) * 100, 2) if abs(float(roe)) <= 5 else round(float(roe), 2)
+            )
 
         notes = []
         ok = True
@@ -146,9 +133,6 @@ def get_fundamental_light(symbol: str) -> dict:
     return out
 
 
-# =========================================================================
-# ANALISA SATU TICKER
-# =========================================================================
 def analyze_intraday(symbol: str, params: dict) -> dict | None:
     ticker = symbol + ".JK"
     try:
@@ -159,6 +143,7 @@ def analyze_intraday(symbol: str, params: dict) -> dict | None:
             progress=False,
             auto_adjust=True,
             multi_level_index=False,
+            threads=False,
         )
     except Exception:
         return None
@@ -188,7 +173,6 @@ def analyze_intraday(symbol: str, params: dict) -> dict | None:
     if last_close < params["min_price"] or last_close > params["max_price"]:
         return None
 
-    # Likuiditas
     avg_val = float((close * vol).tail(20).mean())
     avg_vol = float(vol.tail(20).mean())
     if avg_val < params["min_avg_value_rp"] * 0.8:
@@ -196,7 +180,6 @@ def analyze_intraday(symbol: str, params: dict) -> dict | None:
     if avg_vol < params["min_avg_volume"] * 0.8:
         return None
 
-    # Level & struktur
     high_20 = float(high.tail(20).max())
     low_20 = float(low.tail(20).min())
     range_20_pct = (high_20 - low_20) / last_close * 100
@@ -213,7 +196,6 @@ def analyze_intraday(symbol: str, params: dict) -> dict | None:
         return None
     atr_pct = atr / last_close * 100
 
-    # Volatilitas harian harus cukup untuk day trade, tapi tidak ekstrem
     if atr_pct < 0.8 or atr_pct > 6.0:
         return None
 
@@ -227,11 +209,9 @@ def analyze_intraday(symbol: str, params: dict) -> dict | None:
     last_low = float(low.iloc[-1])
     bullish_day = last_close > last_open
 
-    # --- Confluence score ---
     score = 0
     reasons = []
 
-    # Trend mikro
     if last_close > ma10 > ma20:
         score += 20
         reasons.append("Trend mikro naik (C>MA10>MA20)")
@@ -239,7 +219,6 @@ def analyze_intraday(symbol: str, params: dict) -> dict | None:
         score += 10
         reasons.append("Di atas MA10")
 
-    # Dekat high / breakout zone (momentum day trade)
     if dist_high <= params["max_dist_to_high_pct"]:
         score += 20
         reasons.append(f"Dekat high20 ({dist_high:.1f}%)")
@@ -247,7 +226,6 @@ def analyze_intraday(symbol: str, params: dict) -> dict | None:
         score += 12
         reasons.append("Bounce zona low + di atas MA20")
 
-    # Volume
     if vol_ratio >= params["min_vol_ratio"]:
         score += 20
         reasons.append(f"Volume {vol_ratio:.2f}x")
@@ -255,7 +233,6 @@ def analyze_intraday(symbol: str, params: dict) -> dict | None:
         score += 8
         reasons.append(f"Volume agak naik {vol_ratio:.2f}x")
 
-    # RSI
     if params["rsi_min"] <= rsi <= params["rsi_max"]:
         score += 15
         reasons.append(f"RSI {rsi:.0f}")
@@ -263,12 +240,10 @@ def analyze_intraday(symbol: str, params: dict) -> dict | None:
         score -= 10
         reasons.append(f"RSI overbought {rsi:.0f}")
 
-    # Candle / struktur hari terakhir
     if bullish_day and last_close >= (last_low + 0.6 * (last_high - last_low)):
         score += 10
         reasons.append("Close kuat di half atas range")
 
-    # ATR sehat untuk intraday
     if 1.2 <= atr_pct <= 4.0:
         score += 10
         reasons.append(f"ATR% {atr_pct:.1f} cocok intraday")
@@ -276,7 +251,6 @@ def analyze_intraday(symbol: str, params: dict) -> dict | None:
     if score < params["min_score"]:
         return None
 
-    # Fundamental ringan
     fund = get_fundamental_light(symbol)
     if params.get("require_fundamental") and not fund["FundOK"]:
         return None
@@ -286,13 +260,11 @@ def analyze_intraday(symbol: str, params: dict) -> dict | None:
     elif not fund["FundOK"]:
         reasons.append("Fund lemah: " + fund["FundNote"])
 
-    # --- Plan intraday (ketat) ---
     entry = round_to_idx_tick(last_close)
 
     sl_atr = entry - params["sl_atr_mult"] * atr
     sl_pct = entry * (1 - params["sl_max_pct"] / 100)
-    stop_raw = max(sl_atr, sl_pct)  # lebih ketat (lebih dekat ke entry)
-    # pastikan di bawah entry
+    stop_raw = max(sl_atr, sl_pct)
     if stop_raw >= entry:
         stop_raw = entry * (1 - 0.01)
     stop_loss = apply_ara_arb_limits(round_to_idx_tick(stop_raw), prev_close, is_target=False)
@@ -306,7 +278,6 @@ def analyze_intraday(symbol: str, params: dict) -> dict | None:
 
     tp_atr = entry + params["tp_atr_mult"] * atr
     tp_pct = entry * (1 + params["tp_max_pct"] / 100)
-    # target jangan tembus high20 terlalu jauh dalam 1 hari tanpa alasan
     tp_cap = min(tp_atr, tp_pct, high_20 * 1.01 if high_20 > entry else tp_pct)
     target = apply_ara_arb_limits(round_to_idx_tick(tp_cap), prev_close, is_target=True)
 
@@ -317,7 +288,6 @@ def analyze_intraday(symbol: str, params: dict) -> dict | None:
     if rr < params["min_rr"]:
         return None
 
-    # Pastikan target masih "intraday-able": reward % tidak gila
     reward_pct = reward / entry * 100
     if reward_pct > params["tp_max_pct"] * 1.2:
         return None
@@ -353,12 +323,11 @@ def analyze_intraday(symbol: str, params: dict) -> dict | None:
     }
 
 
-# =========================================================================
-# RUNNER
-# =========================================================================
 def get_universe(params: dict) -> list:
     if IdxLiquidityScanner is None:
-        return ["BBCA", "BBRI", "BMRI", "BBNI", "TLKM", "ASII", "UNVR", "ICBP", "GOTO", "AMMN"]
+        return [
+            "BBCA", "BBRI", "BMRI", "BBNI", "TLKM", "ASII", "UNVR", "ICBP", "GOTO", "AMMN",
+        ]
     print("=" * 60)
     print("PRE-SCREENER LIKUIDITAS (INTRADAY)")
     print("=" * 60)
@@ -371,12 +340,20 @@ def get_universe(params: dict) -> list:
     return scanner.get_liquid_universe()
 
 
-def run_intraday_screener(user_params: dict | None = None):
+def run_intraday_screener(user_params: dict | None = None, universe=None):
+    """
+    universe: opsional dari confluence/master (cache).
+    Filter intraday tetap di analyze_intraday.
+    """
     params = PARAMS.copy()
     if user_params:
         params.update(user_params)
 
-    universe = get_universe(params)
+    if universe:
+        print(f"Memakai shared universe ({len(universe)} ticker) — skip scan INTRADAY.")
+        universe = [str(t).upper().replace(".JK", "").strip() for t in universe]
+    else:
+        universe = get_universe(params)
     print(f"\nAnalisa intraday confluence untuk {len(universe)} saham...\n")
 
     rows = []
@@ -405,14 +382,18 @@ def run_intraday_screener(user_params: dict | None = None):
 
     print("=" * 110)
     print(f"IDX INTRADAY SCREENER — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"SL maks ~{params['sl_max_pct']}% | TP maks ~{params['tp_max_pct']}% | Min RR {params['min_rr']}")
+    print(
+        f"SL maks ~{params['sl_max_pct']}% | TP maks ~{params['tp_max_pct']}% | "
+        f"Min RR {params['min_rr']}"
+    )
     print("=" * 110)
     print(df[cols].to_string(index=False))
     print("=" * 110)
-    print("Catatan: Konfirmasi di order book / pre-open. Target dirancang untuk 1 sesi, bukan swing.")
+    print("Catatan: Konfirmasi di order book / pre-open. Target dirancang untuk 1 sesi.")
 
     try:
         from idx_report_schema import save_version_report
+
         path = save_version_report(df, "intraday")
     except Exception:
         path = f"idx_report_intraday_{datetime.now().strftime('%Y-%m-%d')}.csv"

@@ -1,20 +1,15 @@
 """
 IDX SMC SCREENER V5 — CHOCH & DISCOUNT ZONE
 ============================================================
-Mencari Change of Character (CHOCH) bullish setelah tekanan jual,
-lalu entry di zona discount yang masih masuk akal untuk market IDX.
++ Filter sweep low (spring) di dekat lowest_low / zona support
+  sebelum entry di discount
 
-Karakter pasar Indonesia yang dipertahankan:
-- Prioritas setup relatif fresh (CHOCH tidak terlalu tua)
-- Validasi struktur turun sederhana (lower high / lower low)
-- Zona discount praktis (bukan hanya ekstrem)
-- RR minimum realistis (1.5), bukan 2.0 kaku
-- Tick size + ARA/ARB BEI
+Karakter IDX:
+- CHOCH relatif fresh
+- Discount praktis (38.2–78.6)
+- RR min 1.5
+- Tick + ARA/ARB
 - SL di bawah invalidation (swing low)
-
-+ SL hybrid kondisional (sama seperti V4):
-  - Invalidasi (lowest_low) ≤ max_sl_pct → ATR boleh memperketat
-  - Di luar range → SL struktur murni
 """
 
 from __future__ import annotations
@@ -25,11 +20,12 @@ import yfinance as yf
 from datetime import datetime
 from idx_liquidity_scanner import IdxLiquidityScanner
 
-SL_PARAMS = {
-    "atr_period": 14,
-    "sl_struct_buf": 0.015,
-    "sl_atr_mult": 1.2,
-    "max_sl_pct": 3.5,
+# Parameter sweep low (bisa dioverride lewat user_params)
+SWEEP_PARAMS = {
+    "require_sweep_low": False,   # True = wajib ada sweep low
+    "sweep_lookback": 15,
+    "sweep_min_wick_pct": 0.30,   # minimal penetrasi di bawah level (%)
+    "sweep_max_close_above_pct": 0.5,  # close harus reclaim di atas level
 }
 
 
@@ -59,49 +55,36 @@ def apply_ara_arb_limits(price: float, prev_close: float, is_target: bool) -> fl
     return min(price, ara) if is_target else max(price, arb)
 
 
-def compute_atr(df: pd.DataFrame, period: int = 14) -> float:
-    h, l, c = df["High"], df["Low"], df["Close"]
-    prev = c.shift(1)
-    tr = pd.concat([h - l, (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
-    val = float(tr.rolling(period).mean().iloc[-1])
-    return val if val == val and val > 0 else 0.0
+def detect_liquidity_sweep_low(
+    df: pd.DataFrame,
+    support: float,
+    lookback: int = 15,
+    min_wick_pct: float = 0.30,
+) -> dict:
+    """
+    Sweep low = Low menusuk di bawah support, Close reclaim di atas support.
+    (stop-hunt / spring) dalam lookback bar, sebelum bar terakhir.
+    """
+    if support <= 0 or len(df) < lookback + 2:
+        return {"has_sweep": False, "sweep_low": 0.0, "wick_pct": 0.0}
 
-
-def stop_loss_struct_with_optional_atr(
-    entry: float,
-    struct_level: float,
-    atr: float,
-    prev_close: float,
-    params: dict,
-) -> tuple[int, str]:
-    buf = params.get("sl_struct_buf", 0.015)
-    k = params.get("sl_atr_mult", 1.2)
-    max_sl_pct = params.get("max_sl_pct", 3.5)
-
-    sl_struct = float(struct_level) * (1.0 - buf)
-    if sl_struct >= entry:
-        sl_struct = entry * 0.99
-
-    dist_pct = (entry - sl_struct) / entry * 100.0
-
-    if dist_pct <= max_sl_pct and atr and atr > 0:
-        sl_atr = entry - k * atr
-        stop_raw = max(sl_struct, sl_atr)
-        source = "struct+atr"
-    else:
-        stop_raw = sl_struct
-        source = "struct"
-
-    if stop_raw >= entry:
-        stop_raw = entry * 0.99
-
-    stop = round_to_idx_tick(stop_raw)
-    stop = apply_ara_arb_limits(stop, prev_close, is_target=False)
-    if stop >= entry:
-        stop = apply_ara_arb_limits(
-            round_to_idx_tick(entry * 0.99), prev_close, is_target=False
-        )
-    return int(stop), source
+    start = max(0, len(df) - lookback - 1)
+    end = len(df) - 1
+    for i in range(end - 1, start - 1, -1):
+        lo = float(df["Low"].iloc[i])
+        cl = float(df["Close"].iloc[i])
+        # menusuk bawah + close kembali di atas / sangat dekat support
+        if lo < support * 0.999 and cl >= support * 0.998:
+            wick_pct = (min(cl, support) - lo) / support * 100
+            if wick_pct >= min_wick_pct or lo < support * 0.997:
+                return {
+                    "has_sweep": True,
+                    "sweep_low": lo,
+                    "sweep_close": cl,
+                    "wick_pct": round(wick_pct, 2),
+                    "bars_ago": end - i,
+                }
+    return {"has_sweep": False, "sweep_low": 0.0, "wick_pct": 0.0}
 
 
 def detect_choch_and_discount(df: pd.DataFrame, lookback: int = 60) -> dict | None:
@@ -117,7 +100,8 @@ def detect_choch_and_discount(df: pd.DataFrame, lookback: int = 60) -> dict | No
     low = df_sub["Low"].values
     close = df_sub["Close"].values
 
-    swing_highs, swing_lows = [], []
+    swing_highs = []
+    swing_lows = []
     for i in range(2, len(df_sub) - 2):
         if (
             high[i] > high[i - 1]
@@ -150,6 +134,7 @@ def detect_choch_and_discount(df: pd.DataFrame, lookback: int = 60) -> dict | No
         if close[i] > last_sh_val:
             choch_rel = i
             break
+
     if choch_rel == -1:
         return None
 
@@ -167,16 +152,21 @@ def detect_choch_and_discount(df: pd.DataFrame, lookback: int = 60) -> dict | No
     if range_up / last_close_sub < 0.04:
         return None
 
+    fibo_382 = peak_after - range_up * 0.382
+    fibo_50 = peak_after - range_up * 0.50
+    fibo_618 = peak_after - range_up * 0.618
+    fibo_786 = peak_after - range_up * 0.786
+
     return {
         "choch_idx": start_pos + choch_rel,
         "choch_val": last_sh_val,
         "choch_age": age_bars,
         "lowest_low": lowest_low,
         "peak": peak_after,
-        "fibo_382": peak_after - range_up * 0.382,
-        "fibo_50": peak_after - range_up * 0.50,
-        "fibo_618": peak_after - range_up * 0.618,
-        "fibo_786": peak_after - range_up * 0.786,
+        "fibo_382": fibo_382,
+        "fibo_50": fibo_50,
+        "fibo_618": fibo_618,
+        "fibo_786": fibo_786,
         "has_lower_high": has_lower_high,
         "has_lower_low": has_lower_low,
     }
@@ -187,13 +177,13 @@ def analyze_smc_v5_ticker(symbol: str, user_params: dict = None) -> dict | None:
 
     account_size = 50_000_000
     risk_pct = 1.0
-    sl_cfg = SL_PARAMS.copy()
+    sw = SWEEP_PARAMS.copy()
     if user_params:
         account_size = user_params.get("account_size", account_size)
         risk_pct = user_params.get("risk_per_trade_pct", risk_pct)
-        for k in SL_PARAMS:
+        for k in SWEEP_PARAMS:
             if k in user_params:
-                sl_cfg[k] = user_params[k]
+                sw[k] = user_params[k]
 
     try:
         df = yf.download(
@@ -227,6 +217,7 @@ def analyze_smc_v5_ticker(symbol: str, user_params: dict = None) -> dict | None:
         return None
 
     last_close = float(df["Close"].iloc[-1])
+
     choch = detect_choch_and_discount(df, lookback=60)
     if not choch:
         return None
@@ -239,15 +230,44 @@ def analyze_smc_v5_ticker(symbol: str, user_params: dict = None) -> dict | None:
         return None
 
     deep_discount = last_close <= choch["fibo_50"]
-    entry = round_to_idx_tick(last_close)
-    atr = compute_atr(df, sl_cfg["atr_period"])
 
-    stop_loss, sl_src = stop_loss_struct_with_optional_atr(
-        entry=entry,
-        struct_level=float(choch["lowest_low"]),
-        atr=atr,
-        prev_close=last_close,
-        params=sl_cfg,
+    # --- Sweep low di support (lowest_low / fibo dalam) ---
+    support_level = float(choch["lowest_low"])
+    # juga coba level Fibo 78.6 sebagai support sekunder
+    sweep = detect_liquidity_sweep_low(
+        df,
+        support=support_level,
+        lookback=int(sw["sweep_lookback"]),
+        min_wick_pct=float(sw["sweep_min_wick_pct"]),
+    )
+    if not sweep["has_sweep"]:
+        # fallback: sweep di fibo_786
+        sweep_f = detect_liquidity_sweep_low(
+            df,
+            support=float(choch["fibo_786"]),
+            lookback=int(sw["sweep_lookback"]),
+            min_wick_pct=float(sw["sweep_min_wick_pct"]),
+        )
+        if sweep_f["has_sweep"]:
+            sweep = sweep_f
+            sweep["level_note"] = "Fibo786"
+        else:
+            sweep["level_note"] = "LowestLow"
+    else:
+        sweep["level_note"] = "LowestLow"
+
+    if sw.get("require_sweep_low", False) and not sweep["has_sweep"]:
+        return None
+
+    entry = round_to_idx_tick(last_close)
+
+    stop_loss_raw = choch["lowest_low"] * 0.985
+    # jika ada sweep, SL sedikit di bawah sweep low
+    if sweep["has_sweep"] and sweep.get("sweep_low", 0) > 0:
+        stop_loss_raw = min(stop_loss_raw, float(sweep["sweep_low"]) * 0.99)
+
+    stop_loss = apply_ara_arb_limits(
+        round_to_idx_tick(stop_loss_raw), last_close, is_target=False
     )
 
     risk_per_share = entry - stop_loss
@@ -257,6 +277,7 @@ def analyze_smc_v5_ticker(symbol: str, user_params: dict = None) -> dict | None:
     target_1 = apply_ara_arb_limits(
         round_to_idx_tick(choch["peak"]), last_close, is_target=True
     )
+
     rr_ratio = (target_1 - entry) / risk_per_share if risk_per_share > 0 else 0
     if rr_ratio < 1.5:
         return None
@@ -281,7 +302,13 @@ def analyze_smc_v5_ticker(symbol: str, user_params: dict = None) -> dict | None:
     elif choch["has_lower_high"] or choch["has_lower_low"]:
         score += 8
         reasons.append("Struktur turun")
-    reasons.append(f"SL:{sl_src}")
+
+    if sweep["has_sweep"]:
+        score += 15
+        reasons.append(
+            f"Sweep low ({sweep.get('level_note', '')} wick "
+            f"{sweep.get('wick_pct', 0)}%, {sweep.get('bars_ago', '?')} bar lalu)"
+        )
 
     risk_rp = account_size * (risk_pct / 100.0)
     shares = int(risk_rp / risk_per_share) if risk_per_share > 0 else 0
@@ -298,11 +325,12 @@ def analyze_smc_v5_ticker(symbol: str, user_params: dict = None) -> dict | None:
         "Fibo_786": round_to_idx_tick(choch["fibo_786"]),
         "Entry": entry,
         "StopLoss": stop_loss,
-        "SL_Source": sl_src,
-        "ATR": round(atr, 0),
         "Target(Peak)": target_1,
         "RR_Ratio": round(rr_ratio, 2),
         "Score": score,
+        "SweepLow": "Ya" if sweep["has_sweep"] else "Tidak",
+        "SweepLowPrice": round_to_idx_tick(sweep.get("sweep_low", 0)),
+        "SweepWickPct": sweep.get("wick_pct", 0),
         "Alasan": "; ".join(reasons),
         "Lots": lots,
         "EstLoss(Rp)": round(actual_shares * risk_per_share, 0),
@@ -311,15 +339,39 @@ def analyze_smc_v5_ticker(symbol: str, user_params: dict = None) -> dict | None:
     }
 
 
-def run_screener_v5(user_params: dict = None):
-    print("Mempersiapkan Universe Likuiditas (SMC V5)...")
-    scanner = IdxLiquidityScanner(
-        min_avg_value_rp=10_000_000_000,
-        min_avg_volume=1_000_000,
-    )
-    universe = scanner.get_liquid_universe()
+def run_screener_v5(user_params: dict = None, universe=None):
+    """
+    universe: opsional — daftar ticker dari master/confluence (hindari scan ulang).
+    """
+    if universe:
+        print(
+            f"Memakai shared universe ({len(universe)} ticker) — skip scan likuiditas V5."
+        )
+    else:
+        print("Mempersiapkan Universe Likuiditas (SMC V5)...")
 
-    print(f"\nMenjalankan Screener SMC V5 (CHOCH) untuk {len(universe)} saham...")
+        def _liq():
+            scanner = IdxLiquidityScanner(
+                min_avg_value_rp=10_000_000_000,
+                min_avg_volume=1_000_000,
+                lookback_days=20,
+                max_workers=15,
+            )
+            return scanner.get_liquid_universe()
+
+        try:
+            from idx_gdrive_data import resolve_screener_universe
+
+            universe = resolve_screener_universe(fallback_fn=_liq)
+        except Exception:
+            universe = _liq()
+        if not universe:
+            universe = _liq()
+
+    print(
+        f"\nMenjalankan Screener SMC V5 (CHOCH + Sweep Low) "
+        f"untuk {len(universe)} saham..."
+    )
     results = []
     for i, sym in enumerate(universe, 1):
         print(f"  [{i}/{len(universe)}] Cek {sym}...", end="\r")
@@ -331,6 +383,7 @@ def run_screener_v5(user_params: dict = None):
             continue
 
     print(" " * 60, end="\r")
+
     if not results:
         print("Tidak ada saham di zona Discount pasca CHOCH yang valid hari ini.")
         return None
@@ -343,14 +396,13 @@ def run_screener_v5(user_params: dict = None):
     print(f"SMC CHOCH & DISCOUNT V5 — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print("=" * 100)
     cols = [
-        "Ticker", "Close", "CHOCH_Level", "CHOCH_Age", "Entry", "StopLoss",
-        "SL_Source", "Target(Peak)", "RR_Ratio", "Score", "Lots", "Alasan",
+        "Ticker", "Close", "CHOCH_Level", "CHOCH_Age", "SweepLow", "Entry",
+        "StopLoss", "Target(Peak)", "RR_Ratio", "Score", "Lots", "Alasan",
     ]
     cols = [c for c in cols if c in df_res.columns]
     print(df_res[cols].to_string(index=False))
     print("=" * 100)
 
-    # [FIX] sebelumnya salah tulis V4 / save v4
     df_res["Strategy"] = "V5 (SMC CHOCH)"
     try:
         from idx_report_schema import save_version_report

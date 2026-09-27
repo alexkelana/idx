@@ -605,6 +605,24 @@ def run_orchestrator(
         "broker_sell_pct": float(broker_sell_pct),
     }
 
+    # Scan likuiditas SEKALI untuk semua strategi di sesi ini
+    shared_universe: list = []
+    try:
+        from idx_liquidity_scanner import get_shared_liquid_universe
+
+        print("\n[master] Prefetch universe likuiditas (sekali untuk semua strategi)...")
+        shared_universe = get_shared_liquid_universe(
+            min_avg_value_rp=10_000_000_000,
+            min_avg_volume=1_000_000,
+            lookback_days=20,
+            max_workers=15,
+            force_refresh=False,
+        )
+        print(f"[master] Shared universe: {len(shared_universe)} ticker")
+    except Exception as e:
+        print(f"[master] Prefetch universe gagal (setiap strategi akan scan sendiri): {e}")
+        shared_universe = []
+
     for strat in strategies:
         try:
             if strat == "V2":
@@ -612,24 +630,36 @@ def run_orchestrator(
                 module = importlib.import_module("idx_breakout_screener_v2")
                 if hasattr(module, "PARAMS") and isinstance(module.PARAMS, dict):
                     module.PARAMS.update(user_params)
-                module.run_screener(params=getattr(module, "PARAMS", user_params))
+                module.run_screener(
+                    universe=shared_universe or None,
+                    params=getattr(module, "PARAMS", user_params),
+                )
 
             elif strat == "V3":
                 print("\n>>> Memulai IDX Fibo Retest Screener V3...")
                 module = importlib.import_module("idx_breakout_screener_v3")
                 if hasattr(module, "PARAMS") and isinstance(module.PARAMS, dict):
                     module.PARAMS.update(user_params)
-                module.run_screener(params=getattr(module, "PARAMS", user_params))
+                module.run_screener(
+                    universe=shared_universe or None,
+                    params=getattr(module, "PARAMS", user_params),
+                )
 
             elif strat == "V4":
                 print("\n>>> Memulai IDX SMC Screener V4...")
                 module = importlib.import_module("idx_breakout_screener_v4_smc")
-                module.run_screener_v4(user_params=user_params)
+                module.run_screener_v4(
+                    user_params=user_params,
+                    universe=shared_universe or None,
+                )
 
             elif strat == "V5":
                 print("\n>>> Memulai IDX SMC Screener V5...")
                 module = importlib.import_module("idx_breakout_screener_v5_smc")
-                module.run_screener_v5(user_params=user_params)
+                module.run_screener_v5(
+                    user_params=user_params,
+                    universe=shared_universe or None,
+                )
 
         except Exception as e:
             print(f"Error saat menjalankan strategi {strat}: {e}")
