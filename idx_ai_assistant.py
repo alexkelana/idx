@@ -1071,51 +1071,141 @@ def _sectors_urls(ticker: str) -> dict[str, str]:
     }
 
 
-def _load_fundamentals_override(ticker: str) -> dict[str, Any] | None:
-    """
-    Baca fundamentals override (prioritas: Google Drive URL di secrets, lalu file lokal).
-    Kolom: Ticker, PE, PB, EPS, ROE, MarketCap, Sector, Industry, Name,
-           DividendYield, DebtToEquity, ProfitMargin, AsOf, Source, Notes
-    """
-    t = str(ticker).upper().strip().replace(".JK", "")
 
-    df = None
-    source_label = "none"
+def _parse_metric_number(val) -> float | None:
+    """Parse angka kotor dari export Screener: '1,031.63 B', '6.40%', '-', 'N/A'."""
+    if val is None:
+        return None
+    try:
+        if isinstance(val, (int, float)):
+            if val != val:  # NaN
+                return None
+            return float(val)
+    except Exception:
+        pass
+    s = str(val).strip()
+    if not s or s in ("-", "—", "N/A", "n/a", "NA", "null", "None", "#N/A"):
+        return None
+    s = s.replace(",", "").replace(" ", "")
+    mult = 1.0
+    su = s.upper()
+    if su.endswith("%"):
+        s = s[:-1]
+        try:
+            return float(s)
+        except Exception:
+            return None
+    if su.endswith("T"):
+        mult = 1e12
+        s = s[:-1]
+    elif su.endswith("B"):
+        mult = 1e9
+        s = s[:-1]
+    elif su.endswith("M"):
+        mult = 1e6
+        s = s[:-1]
+    elif su.endswith("K"):
+        mult = 1e3
+        s = s[:-1]
+    try:
+        return float(s) * mult
+    except Exception:
+        return None
+
+
+def _iter_fundamentals_override_frames() -> list[tuple[pd.DataFrame, str]]:
+    """Kumpulkan semua sumber override (gdrive + setiap file lokal yang ada)."""
+    frames: list[tuple[pd.DataFrame, str]] = []
+    seen_paths: set[str] = set()
+
     try:
         from idx_gdrive_data import load_fundamentals_override_df
 
         df, source_label = load_fundamentals_override_df()
+        if df is not None and not df.empty:
+            frames.append((df, source_label or "gdrive"))
     except Exception:
-        df = None
+        pass
 
-    if df is None or df.empty:
-        # fallback lokal murni (tanpa modul gdrive)
-        candidates: list[str] = []
-        for d in _search_dirs():
-            candidates.append(os.path.join(d, "fundamentals_override.csv"))
+    candidates: list[str] = []
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        candidates.append(os.path.join(here, "fundamentals_override.csv"))
+    except Exception:
+        pass
+    for d in _search_dirs():
+        candidates.append(os.path.join(d, "fundamentals_override.csv"))
+    candidates.extend(
+        [
+            os.path.join(os.getcwd(), "fundamentals_override.csv"),
+            "fundamentals_override.csv",
+            "/home/workdir/artifacts/fundamentals_override.csv",
+            "/home/workdir/attachments/fundamentals_override.csv",
+        ]
+    )
+    for path in candidates:
         try:
-            here = os.path.dirname(os.path.abspath(__file__))
-            candidates.insert(0, os.path.join(here, "fundamentals_override.csv"))
+            key = os.path.abspath(path)
         except Exception:
-            pass
-        path = next((p for p in candidates if os.path.isfile(p)), None)
-        if not path:
-            return None
+            key = path
+        if key in seen_paths or not os.path.isfile(path):
+            continue
+        seen_paths.add(key)
         try:
             df = pd.read_csv(path, index_col=False)
-            source_label = f"local:{path}"
+            if df is not None and not df.empty:
+                frames.append((df, f"local:{path}"))
         except Exception:
-            return None
+            continue
+    return frames
 
-    if df is None or df.empty:
+
+def _load_fundamentals_override(ticker: str) -> dict[str, Any] | None:
+    """
+    Baca fundamentals override dari SEMUA sumber sampai ticker ketemu.
+    Prioritas: Google Drive (jika secrets) lalu file lokal.
+    Kolom ticker yang dikenali: Ticker, ticker, Kode, Symbol, Code, Emiten.
+    """
+    t = str(ticker).upper().strip().replace(".JK", "")
+    frames = _iter_fundamentals_override_frames()
+    if not frames:
         return None
-    df.columns = [str(c).strip() for c in df.columns]
-    if "Ticker" not in df.columns and "ticker" not in [c.lower() for c in df.columns]:
-        df = df.reset_index()
+
+    def _find_row(df: pd.DataFrame):
+        df = df.copy()
         df.columns = [str(c).strip() for c in df.columns]
-    colmap = {str(c).strip().lower(): c for c in df.columns}
-    tcol = colmap.get("ticker")
-    if not tcol:
+        colmap = {str(c).strip().lower(): c for c in df.columns}
+        tcol = (
+            colmap.get("ticker")
+            or colmap.get("kode")
+            or colmap.get("symbol")
+            or colmap.get("code")
+            or colmap.get("emiten")
+            or colmap.get("saham")
+        )
+        if not tcol:
+            return None, colmap
+        series = (
+            df[tcol]
+            .astype(str)
+            .str.upper()
+            .str.replace(".JK", "", regex=False)
+            .str.strip()
+        )
+        hit = df[series == t]
+        if hit.empty:
+            return None, colmap
+        return hit.iloc[0], colmap
+
+    row = None
+    colmap: dict = {}
+    source_label = "none"
+    for df, label in frames:
+        found, cmap = _find_row(df)
+        if found is not None:
+            row, colmap, source_label = found, cmap, label
+            break
+    if row is None:
         return None
 
     def _cell(row, *keys):
@@ -1127,21 +1217,78 @@ def _load_fundamentals_override(ticker: str) -> dict[str, Any] | None:
                     continue
                 return v
         return None
-
-    hit = df[df[tcol].astype(str).str.upper().str.replace(".JK", "", regex=False) == t]
-    if hit.empty:
-        return None
-    row = hit.iloc[0]
-    pe = _safe_float(_cell(row, "pe", "pe_ratio", "trailing_pe"))
-    pb = _safe_float(_cell(row, "pb", "pb_ratio", "price_to_book"))
-    eps = _safe_float(_cell(row, "eps"))
-    roe = _safe_float(_cell(row, "roe"))
-    mcap = _safe_float(_cell(row, "marketcap", "market_cap"))
-    div_y = _safe_float(_cell(row, "dividendyield", "dividend_yield", "dividend_yield_pct"))
-    debt = _safe_float(_cell(row, "debttoequity", "debt_to_equity"))
-    pm = _safe_float(_cell(row, "profitmargin", "profit_margin", "profit_margin_pct"))
+    pe = _parse_metric_number(
+        _cell(
+            row,
+            "pe",
+            "pe_ratio",
+            "trailing_pe",
+            "current pe ratio (ttm)",
+            "current pe ratio",
+            "pe ratio",
+        )
+    )
+    pb = _parse_metric_number(
+        _cell(
+            row,
+            "pb",
+            "pb_ratio",
+            "price_to_book",
+            "current price to book value",
+            "price to book value",
+            "pbv",
+        )
+    )
+    eps = _parse_metric_number(
+        _cell(row, "eps", "current eps (ttm)", "current eps", "eps (ttm)")
+    )
+    roe = _parse_metric_number(
+        _cell(
+            row,
+            "roe",
+            "average (roe 5 yr)",
+            "average roe 5 yr",
+            "roe 5 yr",
+            "return on equity",
+        )
+    )
+    mcap = _parse_metric_number(
+        _cell(row, "marketcap", "market_cap", "market cap")
+    )
+    div_y = _parse_metric_number(
+        _cell(
+            row,
+            "dividendyield",
+            "dividend_yield",
+            "dividend_yield_pct",
+            "dividend yield",
+        )
+    )
+    debt = _parse_metric_number(
+        _cell(
+            row,
+            "debttoequity",
+            "debt_to_equity",
+            "debt to equity ratio (quarter)",
+            "debt to equity ratio",
+            "debt to equity",
+        )
+    )
+    pm = _parse_metric_number(
+        _cell(
+            row,
+            "profitmargin",
+            "profit_margin",
+            "profit_margin_pct",
+            "net profit margin (ttm)(%)",
+            "net profit margin (ttm)",
+            "net profit margin",
+        )
+    )
     urls = _sectors_urls(t)
     src = str(_cell(row, "source") or "fundamentals_override").strip()
+    if not src or src.lower() in ("nan", "none"):
+        src = "fundamentals_override"
     conf_note = (
         f"Override dari {source_label}."
         if source_label.startswith("gdrive")
