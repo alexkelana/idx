@@ -1,15 +1,17 @@
 """
-IDX PULLBACK & RETEST SCREENER — v3 (upgraded)
+IDX PULLBACK & RETEST SCREENER — v3 (upgraded + SL napas)
 ================================================
 Buy on Weakness setelah Breakout + zona Fibonacci.
 
-Upgrade:
-  - SL hybrid: min(breakout-buffer, swing_low, entry-k*ATR) + tick BEI
-  - Konfirmasi retest: touch zona Fibo + close hold / rejection wick
-  - Regime mingguan bertingkat: strict | normal | relaxed
-  - TP/RR realistis: TP1 = max(peak, entry+tp1_r*R) terbatas ARA
-  - Kolom: DaysSinceBO, DistToFibo382, Quality, NetPnL (fee)
-  - Volume koreksi tetap score (bukan hard reject); penalti jika vol naik
+[FIX SL]
+  Masalah: SL bisa << 1×ATR (mis. SRSN risk 0.25×ATR) → noise stop.
+  Solusi:
+    1) structural = min(BO-buffer, swing×0.995)
+    2) atr_preferred = entry - atr_sl_mult×ATR (default 1.35)
+    3) stop = min(structural, atr_preferred)
+    4) enforce lantai: risk >= min_sl_atr_mult×ATR (default 1.0)
+    5) plafon: risk <= max_sl_pct dari entry (default 9%)
+    6) tolak setup jika risk akhir < 0.8×ATR
 """
 
 from __future__ import annotations
@@ -22,9 +24,6 @@ import yfinance as yf
 
 from idx_liquidity_scanner import IdxLiquidityScanner
 
-# =========================================================================
-# PARAMETER
-# =========================================================================
 PARAMS = {
     "lookback_days": 350,
     "breakout_lookback": 15,
@@ -33,29 +32,25 @@ PARAMS = {
     "roc_period": 10,
     "stop_buffer_pct": 2.0,
     "atr_period": 14,
-    "atr_sl_mult": 1.2,
+    "atr_sl_mult": 1.35,
+    "min_sl_atr_mult": 1.0,
+    "max_sl_pct": 9.0,
+    "min_risk_atr": 0.8,
     "account_size": 50_000_000,
     "risk_per_trade_pct": 1.0,
     "lot_size": 100,
     "min_rr": 1.2,
     "tp1_r": 1.5,
     "tp2_ext": 0.272,
-    # Fee (fraksi)
     "buy_fee": 0.0015,
     "sell_fee": 0.0025,
-    # Regime: strict | normal | relaxed
     "regime_mode": "relaxed",
-    # Retest confirmation
     "require_retest_touch": False,
-    "retest_wick_min_pct": 0.15,  # lower wick vs range (rejection)
-    # Quality thresholds
+    "retest_wick_min_pct": 0.15,
     "min_score": 35,
 }
 
 
-# =========================================================================
-# UTILITAS BEI
-# =========================================================================
 def round_to_idx_tick(price: float) -> int:
     if pd.isna(price) or price <= 0:
         return 0
@@ -95,11 +90,7 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high, low, close = df["High"], df["Low"], df["Close"]
     prev_close = close.shift(1)
     tr = pd.concat(
-        [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
         axis=1,
     ).max(axis=1)
     return tr.rolling(period).mean()
@@ -109,19 +100,12 @@ def compute_adx(df: pd.DataFrame, period: int = 14):
     high, low, close = df["High"], df["Low"], df["Close"]
     up = high - high.shift(1)
     down = low.shift(1) - low
-
     plus_dm = np.where((up > down) & (up > 0), up, 0.0)
     minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-
     tr = pd.concat(
-        [
-            high - low,
-            (high - close.shift(1)).abs(),
-            (low - close.shift(1)).abs(),
-        ],
+        [high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()],
         axis=1,
     ).max(axis=1)
-
     atr = tr.ewm(alpha=1 / period, adjust=False).mean()
     plus_di = (
         100
@@ -152,9 +136,71 @@ def quality_tier(score: int, rr: float, retest_ok: bool, vol_valid: bool) -> str
     return "D"
 
 
-# =========================================================================
-# UNIVERSE
-# =========================================================================
+def compute_hybrid_stop(
+    entry: float,
+    breakout_price: float,
+    swing_low: float,
+    atr: float,
+    last_close: float,
+    params: dict,
+) -> tuple[float, str, float, float]:
+    """SL long + ruang napas. Return (stop, source, risk_atr, risk_pct)."""
+    atr_mult = float(params.get("atr_sl_mult", 1.35))
+    min_atr_mult = float(params.get("min_sl_atr_mult", 1.0))
+    max_sl_pct = float(params.get("max_sl_pct", 9.0))
+    buf = float(params.get("stop_buffer_pct", 2.0))
+
+    stop_by_bo = breakout_price * (1 - buf / 100.0)
+    stop_by_swing = swing_low * 0.995
+    structural = min(stop_by_bo, stop_by_swing)
+
+    if atr > 0:
+        atr_preferred = entry - atr_mult * atr
+        atr_floor = entry - min_atr_mult * atr
+    else:
+        atr_preferred = entry * (1 - 0.03)
+        atr_floor = entry * (1 - 0.02)
+
+    stop_raw = min(structural, atr_preferred)
+
+    if stop_raw > atr_floor:
+        stop_raw = atr_floor
+        source = "ATR_floor"
+    elif structural <= atr_preferred:
+        source = "structure"
+    else:
+        source = "ATR"
+
+    max_depth = entry * (1 - max_sl_pct / 100.0)
+    if stop_raw < max_depth:
+        stop_raw = max_depth
+        source = source + "+cap"
+
+    if stop_raw >= entry:
+        stop_raw = entry - max(
+            atr * min_atr_mult if atr > 0 else entry * 0.02, entry * 0.015
+        )
+        source = "fallback"
+
+    stop_loss = apply_ara_arb_limits(
+        round_to_idx_tick(stop_raw), last_close, is_target=False
+    )
+    if stop_loss >= entry:
+        stop_loss = apply_ara_arb_limits(
+            round_to_idx_tick(
+                entry - max(atr * min_atr_mult if atr > 0 else entry * 0.02, 1)
+            ),
+            last_close,
+            is_target=False,
+        )
+        source = "fallback_tick"
+
+    risk = entry - stop_loss
+    risk_atr = (risk / atr) if atr > 0 else 0.0
+    risk_pct = (risk / entry * 100) if entry > 0 else 0.0
+    return float(stop_loss), source, float(risk_atr), float(risk_pct)
+
+
 def get_dynamic_liquidity_universe() -> list:
     print("=" * 60)
     print("TAHAP 1: UNIVERSE (Google Drive → likuiditas)")
@@ -179,17 +225,12 @@ def get_dynamic_liquidity_universe() -> list:
         universe = _liq()
 
     print("=" * 60)
-    print("TAHAP 2: ANALISA PULLBACK / RETEST (V3 upgraded)")
+    print("TAHAP 2: ANALISA PULLBACK / RETEST (V3 SL-napas)")
     print("=" * 60)
     return universe
 
 
 def check_weekly_regime(df: pd.DataFrame, mode: str) -> tuple[bool, str]:
-    """
-    strict  : Close > MA10w > MA30w dan MA10 naik
-    normal  : strict OR soft (Close > MA10w dan MA10w >= MA30w*0.98)
-    relaxed : tolak hanya clear bear (Close < MA10w < MA30w)
-    """
     weekly = (
         df.resample("W")
         .agg(
@@ -230,16 +271,13 @@ def check_weekly_regime(df: pd.DataFrame, mode: str) -> tuple[bool, str]:
             if strict_bull
             else ("Weekly Soft-Bull" if soft_bull else "Weekly Non-Bear")
         )
-    else:  # normal
+    else:
         ok = strict_bull or soft_bull
         label = "Weekly Strict-Bull" if strict_bull else "Weekly Soft-Bull"
 
     return ok, label
 
 
-# =========================================================================
-# ANALISA SATU TICKER
-# =========================================================================
 def analyze_ticker(symbol: str, params: dict) -> dict | None:
     sym = str(symbol).upper().replace(".JK", "").strip()
     ticker = sym + ".JK"
@@ -276,18 +314,12 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     if len(df) < 150:
         return None
 
-    # ------------------------------------------------------------------
-    # 1. REGIME MINGGUAN (tier)
-    # ------------------------------------------------------------------
     regime_ok, regime_label = check_weekly_regime(
         df, params.get("regime_mode", "normal")
     )
     if not regime_ok:
         return None
 
-    # ------------------------------------------------------------------
-    # 2. BREAKOUT TERKONFIRMASI (bukan hari ini)
-    # ------------------------------------------------------------------
     lookback = int(params["breakout_lookback"])
     breakout_idx = -1
     breakout_price = 0.0
@@ -301,13 +333,12 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         cl = float(df["Close"].iloc[i])
         hi = float(df["High"].iloc[i])
         lo = float(df["Low"].iloc[i])
-        op = float(df["Open"].iloc[i])
-        # body relatif kuat opsional: close di setengah atas range
         bar_range = max(hi - lo, 1e-9)
         strong_close = cl >= lo + 0.45 * bar_range
         if (
             cl > past_high
-            and float(df["Volume"].iloc[i]) >= past_vol_avg * params["breakout_vol_ratio"]
+            and float(df["Volume"].iloc[i])
+            >= past_vol_avg * params["breakout_vol_ratio"]
             and strong_close
         ):
             breakout_idx = i
@@ -320,9 +351,6 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
 
     days_since_bo = len(df) - 1 - breakout_idx
 
-    # ------------------------------------------------------------------
-    # 3. FIBONACCI RETRACE
-    # ------------------------------------------------------------------
     swing_low = float(df["Low"].iloc[max(0, breakout_idx - 20) : breakout_idx].min())
     peak = float(df["High"].iloc[breakout_idx:].max())
     range_up = peak - swing_low
@@ -343,21 +371,17 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
 
     in_fibo_zone = fib_618 <= last_close <= fib_236
     above_breakout_support = last_close >= breakout_price * 0.995
-
     if not (in_fibo_zone and above_breakout_support):
         return None
 
-    dist_to_fibo382_pct = (last_close - fib_382) / last_close * 100 if last_close else 0
+    dist_to_fibo382_pct = (
+        (last_close - fib_382) / last_close * 100 if last_close else 0
+    )
 
-    # ------------------------------------------------------------------
-    # 4. KONFIRMASI RETEST (touch zona + hold / rejection)
-    # ------------------------------------------------------------------
     day_range = max(last_high - last_low, 1e-9)
     lower_wick = min(last_open, last_close) - last_low
-    # Touch: low masuk zona Fibo
     touched_zone = last_low <= fib_236 and last_low >= fib_618 * 0.98
     hold_close = last_close >= max(fib_618, breakout_price * 0.995)
-    # Rejection wick ≥ fraction of day range (default 15%)
     rejection = (lower_wick / day_range) >= float(
         params.get("retest_wick_min_pct", 0.15)
     )
@@ -366,9 +390,6 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     if params.get("require_retest_touch", True) and not retest_ok:
         return None
 
-    # ------------------------------------------------------------------
-    # 5. VOLUME KOREKSI (score; penalti jika naik)
-    # ------------------------------------------------------------------
     peak_loc = df["High"].iloc[breakout_idx:].idxmax()
     peak_idx_int = df.index.get_loc(peak_loc)
     if isinstance(peak_idx_int, slice):
@@ -382,9 +403,6 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     is_vol_valid = vol_correction_avg < breakout_vol
     vol_rising_correction = vol_correction_avg >= breakout_vol * 0.95
 
-    # ------------------------------------------------------------------
-    # 6. MOMENTUM + ATR + MA harian (score)
-    # ------------------------------------------------------------------
     atr_series = compute_atr(df, int(params.get("atr_period", 14)))
     atr = float(atr_series.iloc[-1]) if not pd.isna(atr_series.iloc[-1]) else 0.0
 
@@ -403,9 +421,6 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     is_vol_up = last_vol > prev_vol
     reversal_signal = is_bullish_candle and is_vol_up
 
-    # ------------------------------------------------------------------
-    # 7. SCORING
-    # ------------------------------------------------------------------
     score = 15
     reasons = [regime_label]
 
@@ -446,24 +461,17 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     if score < int(params.get("min_score", 35)):
         return None
 
-    # ------------------------------------------------------------------
-    # 8. POSITION PLAN — SL hybrid + TP realistis
-    # ------------------------------------------------------------------
     entry = round_to_idx_tick(last_close)
-
-    stop_by_bo = breakout_price * (1 - params["stop_buffer_pct"] / 100)
-    stop_by_swing = swing_low * 0.995
-    stop_by_atr = entry - params.get("atr_sl_mult", 1.2) * atr if atr > 0 else stop_by_bo
-    # Ambil SL paling konservatif yang masih di bawah entry (jarak lebih lebar)
-    stop_loss_raw = min(stop_by_bo, stop_by_swing, stop_by_atr)
-    if stop_loss_raw >= entry:
-        stop_loss_raw = entry - max(atr * 0.8, entry * 0.015)
-    stop_loss = apply_ara_arb_limits(
-        round_to_idx_tick(stop_loss_raw), last_close, is_target=False
+    stop_loss, sl_source, risk_atr, risk_pct = compute_hybrid_stop(
+        entry, breakout_price, swing_low, atr, last_close, params
     )
 
     risk_per_share = entry - stop_loss
     if risk_per_share <= 0:
+        return None
+
+    min_risk_atr = float(params.get("min_risk_atr", 0.8))
+    if atr > 0 and risk_atr < min_risk_atr:
         return None
 
     tp1_r = float(params.get("tp1_r", 1.5))
@@ -471,7 +479,6 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     target_1 = apply_ara_arb_limits(
         round_to_idx_tick(max(peak, target_r)), last_close, is_target=True
     )
-    # Jika peak di bawah entry (shouldn't), pakai R saja
     if target_1 <= entry:
         target_1 = apply_ara_arb_limits(
             round_to_idx_tick(target_r), last_close, is_target=True
@@ -479,7 +486,10 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
 
     target_2 = apply_ara_arb_limits(
         round_to_idx_tick(
-            max(peak + float(params.get("tp2_ext", 0.272)) * range_up, entry + risk_per_share * 2.5)
+            max(
+                peak + float(params.get("tp2_ext", 0.272)) * range_up,
+                entry + risk_per_share * 2.5,
+            )
         ),
         last_close,
         is_target=True,
@@ -490,7 +500,11 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         return None
 
     risk_rp = params["account_size"] * params["risk_per_trade_pct"] / 100
-    lots = int((risk_rp / risk_per_share) // params["lot_size"]) if risk_per_share > 0 else 0
+    lots = (
+        int((risk_rp / risk_per_share) // params["lot_size"])
+        if risk_per_share > 0
+        else 0
+    )
     shares = lots * params["lot_size"]
 
     net_sl = trade_net_pnl(entry, stop_loss, shares, params)
@@ -517,11 +531,14 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         "Alasan": "; ".join(reasons),
         "Entry": entry,
         "StopLoss": stop_loss,
+        "SL_Source": sl_source,
         "Target1": target_1,
         "Target1(Peak)": target_1,
         "Target2(Ext)": target_2,
         "ATR": round(atr, 0),
         "RiskPerShare": round(risk_per_share, 0),
+        "RiskATR": round(risk_atr, 2),
+        "RiskPct": round(risk_pct, 2),
         "RR_Ratio": round(rr_ratio, 2),
         "Lots": lots,
         "SuggestedShares": shares,
@@ -535,17 +552,19 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     }
 
 
-# =========================================================================
-# RUNNER
-# =========================================================================
 def run_screener(universe=None, params=None):
     params = {**PARAMS, **(params or {})}
-    universe = universe or get_dynamic_liquidity_universe()
-    universe = [str(t).upper().replace(".JK", "").strip() for t in universe]
+    if universe:
+        print(f"Memakai shared universe ({len(universe)} ticker) — skip scan V3.")
+        universe = [str(t).upper().replace(".JK", "").strip() for t in universe]
+    else:
+        universe = get_dynamic_liquidity_universe()
+        universe = [str(t).upper().replace(".JK", "").strip() for t in universe]
 
     print(
-        f"Menjalankan screener V3 upgraded (regime={params.get('regime_mode')}) "
-        f"untuk {len(universe)} saham...\n"
+        f"V3 SL-napas (pref {params.get('atr_sl_mult')}×ATR, "
+        f"floor {params.get('min_sl_atr_mult')}×, cap {params.get('max_sl_pct')}%) "
+        f"| regime={params.get('regime_mode')} | {len(universe)} saham...\n"
     )
     results = []
     for i, sym in enumerate(universe, 1):
@@ -563,21 +582,20 @@ def run_screener(universe=None, params=None):
         print("Tidak ada saham yang lolos filter Pullback/Retest hari ini.")
         return pd.DataFrame()
 
-    df_result = pd.DataFrame(results).sort_values(
-        ["Quality", "Score", "RR_Ratio"], ascending=[True, False, False]
-    )
-    # Quality A before B — map for sort
+    df_result = pd.DataFrame(results)
     order = {"A": 0, "B": 1, "C": 2, "D": 3}
     df_result["_q"] = df_result["Quality"].map(lambda x: order.get(x, 9))
     df_result = (
-        df_result.sort_values(["_q", "Score", "RR_Ratio"], ascending=[True, False, False])
+        df_result.sort_values(
+            ["_q", "Score", "RR_Ratio"], ascending=[True, False, False]
+        )
         .drop(columns=["_q"])
         .reset_index(drop=True)
     )
 
     print("=" * 120)
     print(
-        f"IDX PULLBACK & RETEST SCREENER V3 (upgraded) — "
+        f"IDX PULLBACK & RETEST V3 (SL-napas) — "
         f"{datetime.now().strftime('%Y-%m-%d %H:%M')}"
     )
     print("=" * 120)
@@ -588,14 +606,14 @@ def run_screener(universe=None, params=None):
         "Score",
         "DaysSinceBO",
         "RetestOK",
-        "VolValid",
-        "ADX",
         "Entry",
         "StopLoss",
+        "SL_Source",
+        "RiskATR",
+        "RiskPct",
         "Target1",
         "RR_Ratio",
         "Lots",
-        "NetPnL_TP1",
     ]
     show_cols = [c for c in show_cols if c in df_result.columns]
     print(df_result[show_cols].to_string(index=False))
