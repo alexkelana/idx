@@ -13,7 +13,8 @@ Rezim → Strategi:
   BULLISH_STRONG     → V2
   BULLISH_PULLBACK   → V3
   SIDEWAYS           → V3, V4
-  BEARISH_WEAK/STRONG→ V5
+  BEARISH_WEAK       → V5 (+ Accumulation fallback)
+  BEARISH_STRONG     → Accumulation watchlist (V5 opsional, jarang fire)
 
 [UPDATE]
 - Aktivitas pasar: Volume ^JKSE sering 0 di Yahoo → validasi dulu;
@@ -264,15 +265,21 @@ def analyze_ihsg_regime(lookback_days: int = 180) -> dict:
             "Downtrend: Close < MA20 & MA50.",
             "MA sedang turun (momentum negatif).",
             f"Harga dekat low 20 hari (jarak {dist_to_low_20:.1f}%).",
+            "V5 (CHOCH long) jarang fire di bear murni — prioritas Accumulation watchlist.",
         ]
-        strategies = ["V5"]
+        # Bukan V5-only: CHOCH bullish kontradiktif dengan downtrend kuat
+        strategies = ["Accumulation"]
+        # V5 sebagai sekunder (early bounce) — cascade jika Acc kosong
+        reason.append("Fallback jika kosong: V5 (counter-trend CHOCH, ekspektasi rendah).")
     elif below_ma50 and below_ma20:
         regime = "BEARISH_WEAK"
         reason.append("Harga di bawah MA20 & MA50 (tekanan jual).")
         reason.append("Belum di zona low ekstrem — downtrend / distribusi.")
         if dist_to_low_60 < 8.0:
             reason.append(f"Mendekati low 60 hari (jarak {dist_to_low_60:.1f}%).")
-        strategies = ["V5"]
+        # Early recovery: V5 CHOCH + Accumulation base
+        strategies = ["V5", "Accumulation"]
+        reason.append("V5 = long hanya jika ada CHOCH+discount; Accumulation = late base.")
     else:
         regime = "SIDEWAYS"
         if range_20_pct <= 6.0:
@@ -661,9 +668,147 @@ def run_orchestrator(
                     universe=shared_universe or None,
                 )
 
+            elif strat == "Accumulation":
+                print("\n>>> Memulai IDX Accumulation Screener...")
+                module = importlib.import_module("idx_accumulation_screener")
+                # Entry point resmi: run_accumulation_screener
+                if hasattr(module, "run_accumulation_screener"):
+                    module.run_accumulation_screener(
+                        user_params=user_params,
+                        universe=shared_universe or None,
+                    )
+                elif hasattr(module, "run_screener"):
+                    module.run_screener(
+                        universe=shared_universe or None,
+                        params={**getattr(module, "PARAMS", {}), **user_params},
+                    )
+                elif hasattr(module, "run_screener_accumulation"):
+                    module.run_screener_accumulation(
+                        user_params=user_params,
+                        universe=shared_universe or None,
+                    )
+                else:
+                    print(
+                        "Modul accumulation tidak punya entry point "
+                        "(run_accumulation_screener / run_screener)."
+                    )
+
         except Exception as e:
             print(f"Error saat menjalankan strategi {strat}: {e}")
             print("Pastikan file skrip strategi berada di folder yang sama.")
+
+    # --- Cascade fallback jika semua rekomendasi kosong ---
+    def _report_count(ver: str) -> int:
+        try:
+            import glob as _glob
+            import os as _os
+            import pandas as _pd
+
+            files = _glob.glob(f"idx_report_{ver}_*.csv")
+            if not files:
+                files = _glob.glob(f"**/idx_report_{ver}_*.csv", recursive=True)
+            if not files:
+                return 0
+            latest = max(files, key=_os.path.getmtime)
+            df = _pd.read_csv(latest)
+            return 0 if df is None or df.empty else len(df)
+        except Exception:
+            return 0
+
+    regime_name = str(market_status.get("regime") or "")
+    primary_hits = 0
+    for strat in strategies:
+        ver = {
+            "V2": "v2",
+            "V3": "v3",
+            "V4": "v4",
+            "V5": "v5",
+            "Accumulation": "accumulation",
+            "Intraday": "intraday",
+            "HighBeta": "highbeta",
+        }.get(strat, strat.lower())
+        primary_hits += _report_count(ver)
+
+    FALLBACK_BY_REGIME = {
+        "BEARISH_STRONG": ["V5", "V4"],
+        "BEARISH_WEAK": ["V4", "V3"],
+        "SIDEWAYS": ["V2", "Accumulation"],
+        "BULLISH_PULLBACK": ["V4", "V2"],
+        "BULLISH_STRONG": ["V3"],
+    }
+    if primary_hits == 0:
+        fb = [
+            s
+            for s in FALLBACK_BY_REGIME.get(regime_name, ["V3", "V4"])
+            if s not in strategies
+        ]
+        if fb:
+            print("\n" + "=" * 80)
+            print(
+                f"[CASCADE] Rekomendasi {strategies} kosong (0 setup). "
+                f"Menjalankan fallback: {fb}"
+            )
+            print(
+                "Catatan: di BEAR, V5 sering 0 karena butuh CHOCH bullish — "
+                "fallback hanya pelengkap, bukan sinyal agresif."
+            )
+            print("=" * 80)
+            for strat in fb:
+                try:
+                    if strat == "V2":
+                        module = importlib.import_module("idx_breakout_screener_v2")
+                        if hasattr(module, "PARAMS") and isinstance(module.PARAMS, dict):
+                            module.PARAMS.update(user_params)
+                        module.run_screener(
+                            universe=shared_universe or None,
+                            params=getattr(module, "PARAMS", user_params),
+                        )
+                    elif strat == "V3":
+                        module = importlib.import_module("idx_breakout_screener_v3")
+                        if hasattr(module, "PARAMS") and isinstance(module.PARAMS, dict):
+                            module.PARAMS.update(user_params)
+                        module.run_screener(
+                            universe=shared_universe or None,
+                            params=getattr(module, "PARAMS", user_params),
+                        )
+                    elif strat == "V4":
+                        module = importlib.import_module("idx_breakout_screener_v4_smc")
+                        module.run_screener_v4(
+                            user_params=user_params,
+                            universe=shared_universe or None,
+                        )
+                    elif strat == "V5":
+                        module = importlib.import_module("idx_breakout_screener_v5_smc")
+                        module.run_screener_v5(
+                            user_params=user_params,
+                            universe=shared_universe or None,
+                        )
+                    elif strat == "Accumulation":
+                        try:
+                            module = importlib.import_module("idx_accumulation_screener")
+                            if hasattr(module, "run_accumulation_screener"):
+                                module.run_accumulation_screener(
+                                    user_params=user_params,
+                                    universe=shared_universe or None,
+                                )
+                            elif hasattr(module, "run_screener"):
+                                module.run_screener(
+                                    universe=shared_universe or None,
+                                    params={**getattr(module, "PARAMS", {}), **user_params},
+                                )
+                            elif hasattr(module, "run_screener_accumulation"):
+                                module.run_screener_accumulation(
+                                    user_params=user_params,
+                                    universe=shared_universe or None,
+                                )
+                            else:
+                                print(
+                                    "[CASCADE] Accumulation: entry point tidak ditemukan"
+                                )
+                        except Exception as e_acc:
+                            print(f"[CASCADE] Accumulation gagal: {e_acc}")
+                except Exception as e:
+                    print(f"[CASCADE] Error fallback {strat}: {e}")
 
     apply_enrichment_to_latest_reports(
         broker_buy_pct=float(broker_buy_pct),
@@ -672,6 +817,11 @@ def run_orchestrator(
 
     print("\n" + "=" * 80)
     print("SELESAI — Strategi + Trailing + Fundamental + Biaya/Pajak diproses.")
+    if primary_hits == 0:
+        print(
+            "INFO: Rekomendasi utama kosong — cascade fallback sudah dicoba. "
+            "0 setup di bear kuat = hasil yang wajar (defensif)."
+        )
     print("=" * 80)
 
 
