@@ -144,60 +144,6 @@ REPORT_VERSIONS = [
 ]
 
 # =====================================================================
-# REGIME IHSG — cache + staleness helpers
-#
-# BUG SEBELUMNYA: st.session_state["ihsg_regime"] hanya di-refresh saat
-# tombol "Cek Rezim Sekarang" (Tab Kondisi Pasar) atau mode "AI Adaptive"
-# (Tab Screener) dijalankan. Tab "AI Assistant" cuma MEMBACA cache ini
-# tanpa pernah refresh sendiri -> semua ticker yang dianalisa berturut-turut
-# di Tab AI Assistant memakai regime yang SAMA PERSIS meski sudah basi
-# berjam-jam. Helper di bawah menambal itu: setiap regime disimpan
-# dengan timestamp, dan Tab AI Assistant auto-refresh kalau sudah > TTL.
-# =====================================================================
-IHSG_REGIME_TTL_SECONDS = 900  # 15 menit — di atas ini dianggap basi
-
-
-def _set_ihsg_regime(regime: dict) -> None:
-    """Simpan hasil rezim IHSG ke session_state, dibubuhi timestamp (JSON-safe)."""
-    regime = dict(regime or {})
-    now = datetime.now()
-    regime["fetched_at_epoch"] = now.timestamp()
-    regime["fetched_at_str"] = now.strftime("%d/%m/%Y %H:%M:%S")
-    st.session_state["ihsg_regime"] = regime
-
-
-def _ihsg_regime_age_seconds():
-    """Umur data regime saat ini dalam detik, atau None kalau belum pernah diambil."""
-    reg = st.session_state.get("ihsg_regime") or {}
-    ts = reg.get("fetched_at_epoch")
-    if not ts:
-        return None
-    return datetime.now().timestamp() - ts
-
-
-def _ihsg_regime_is_stale(ttl: int = IHSG_REGIME_TTL_SECONDS) -> bool:
-    age = _ihsg_regime_age_seconds()
-    return age is None or age > ttl
-
-
-def _refresh_ihsg_regime() -> dict:
-    """Ambil ulang rezim IHSG langsung (live) dari master_screener_ai dan cache dengan timestamp baru."""
-    try:
-        import master_screener_ai
-
-        regime = master_screener_ai.analyze_ihsg_regime()
-    except Exception as e:
-        regime = {
-            "regime": "UNKNOWN",
-            "reason": [f"Gagal ambil rezim: {e}"],
-            "strategies": [],
-            "last_close": None,
-        }
-    _set_ihsg_regime(regime)
-    return st.session_state["ihsg_regime"]
-
-
-# =====================================================================
 # SIDEBAR
 # =====================================================================
 st.sidebar.header("⚙️ Modal & Risiko")
@@ -433,6 +379,14 @@ def count_report_rows(version: str) -> int:
         return 0
 
 
+def stockbit_url(ticker: str) -> str:
+    """https://stockbit.com/symbol/BBRI"""
+    t = str(ticker or "").upper().replace(".JK", "").strip()
+    if not t or t in ("NAN", "NONE", "-"):
+        return ""
+    return f"https://stockbit.com/symbol/{t}"
+
+
 def show_report(version: str, title: str):
     path = find_report(version)
     if not path:
@@ -463,19 +417,46 @@ def show_report(version: str, title: str):
         view = df.copy()
         if "Ticker" in view.columns:
             view = view.drop_duplicates(subset=["Ticker"], keep="first")
+            view["Ticker"] = (
+                view["Ticker"].astype(str).str.upper().str.replace(".JK", "", regex=False).str.strip()
+            )
+            # Kolom hyperlink Stockbit (klikable di tabel)
+            view.insert(
+                0,
+                "Stockbit",
+                view["Ticker"].map(stockbit_url),
+            )
             view = view.set_index("Ticker")
 
-        st.dataframe(view, width="stretch", height=480)
-        st.caption(f"Total: {len(view)} baris • Kolom Ticker di-freeze di kiri")
+            st.dataframe(
+                view,
+                width="stretch",
+                height=480,
+                column_config={
+                    "Stockbit": st.column_config.LinkColumn(
+                        "Stockbit",
+                        help="Buka halaman emiten di Stockbit",
+                        display_text="📈 Stockbit",
+                        max_chars=40,
+                    )
+                },
+            )
+        else:
+            st.dataframe(view, width="stretch", height=480)
+
+        st.caption(
+            f"Total: {len(view)} baris • Kolom Ticker di-freeze di kiri • "
+            "Klik **Stockbit** untuk buka https://stockbit.com/symbol/…"
+        )
     except Exception as e:
         st.error(f"Gagal baca: {e}")
 
 
 # =====================================================================
-# MAIN TABS: Kondisi Pasar | Screener | AI Assistant
+# MAIN TABS: Kondisi Pasar | Screener | AI Assistant | Backtest
 # =====================================================================
-tab_pasar, tab_screener, tab_ai = st.tabs(
-    ["📡 Kondisi Pasar", "📊 Screener", "🤖 AI Assistant"]
+tab_pasar, tab_screener, tab_ai, tab_bt = st.tabs(
+    ["📡 Kondisi Pasar", "📊 Screener", "🤖 AI Assistant", "📉 Backtest"]
 )
 
 # ---------- TAB 1: KONDISI PASAR ----------
@@ -486,7 +467,17 @@ with tab_pasar:
 
     if cek_rezim:
         with st.spinner("Mengambil data IHSG..."):
-            _refresh_ihsg_regime()
+            try:
+                import master_screener_ai
+
+                st.session_state["ihsg_regime"] = master_screener_ai.analyze_ihsg_regime()
+            except Exception as e:
+                st.session_state["ihsg_regime"] = {
+                    "regime": "UNKNOWN",
+                    "reason": [str(e)],
+                    "strategies": [],
+                    "last_close": None,
+                }
 
     if "ihsg_regime" not in st.session_state:
         st.session_state["ihsg_regime"] = {
@@ -572,20 +563,6 @@ with tab_pasar:
         st.markdown(f"- {r}")
     if reg.get("strategies"):
         st.markdown(f"**Strategi disarankan:** `{', '.join(reg['strategies'])}`")
-
-    if str(regime) not in ("Belum dicek", "UNKNOWN", ""):
-        age = _ihsg_regime_age_seconds()
-        if age is not None:
-            mins = age / 60
-            if _ihsg_regime_is_stale():
-                st.warning(
-                    f"⏱️ Data rezim ini diambil **{reg.get('fetched_at_str', '?')}** "
-                    f"(±{mins:.0f} menit lalu) — sudah lewat batas segar "
-                    f"{IHSG_REGIME_TTL_SECONDS // 60} menit. Klik **Cek Rezim Sekarang** "
-                    "untuk data terbaru sebelum dipakai analisa ticker."
-                )
-            else:
-                st.caption(f"⏱️ Diambil {reg.get('fetched_at_str', '?')} (±{mins:.0f} menit lalu).")
 
     st.markdown("---")
     st.markdown("##### 📰 Berita pasar (near real-time)")
@@ -777,7 +754,11 @@ with tab_screener:
                     run_ai, account_size, risk_pct, broker_buy, broker_sell
                 )
                 try:
-                    _refresh_ihsg_regime()
+                    import master_screener_ai
+
+                    st.session_state["ihsg_regime"] = (
+                        master_screener_ai.analyze_ihsg_regime()
+                    )
                 except Exception:
                     pass
             elif mode.startswith("V2"):
@@ -995,17 +976,6 @@ with tab_ai:
         )
 
         if run_ai_btn and selected_tickers:
-            # FIX: dulu regime IHSG di sini hanya dibaca dari cache tanpa pernah
-            # di-refresh sendiri, sehingga semua ticker dalam satu batch (bahkan
-            # batch yang dijalankan berjam-jam setelah cache terakhir diisi)
-            # memakai regime yang SAMA PERSIS dan bisa basi. Sekarang: kalau
-            # cache kosong/lebih tua dari TTL, refresh dulu sebelum loop ticker.
-            if _ihsg_regime_is_stale():
-                with st.spinner(
-                    "Rezim IHSG belum ada / sudah basi — mengambil ulang sebelum analisa..."
-                ):
-                    _refresh_ihsg_regime()
-
             regime_ctx = st.session_state.get("ihsg_regime") or {}
             regime_slim = {
                 k: regime_ctx.get(k)
@@ -1022,17 +992,9 @@ with tab_ai:
                     "vol_ratio_20",
                     "range_5_pct",
                     "range_20_pct",
-                    "fetched_at_epoch",
-                    "fetched_at_str",
                 )
                 if k in regime_ctx
             }
-            if regime_slim.get("fetched_at_str"):
-                st.caption(
-                    f"🕒 Regime IHSG untuk batch analisa ini diambil pukul "
-                    f"**{regime_slim['fetched_at_str']}** — dipakai sama untuk "
-                    f"semua ticker: {', '.join(selected_tickers)}."
-                )
             results_ai = []
             with st.spinner(
                 f"Menjalankan agent untuk {', '.join(selected_tickers)}..."
@@ -1084,7 +1046,14 @@ with tab_ai:
 
         for out in st.session_state.get("ai_assistant_results") or []:
             t = out.get("ticker", "?")
-            st.markdown(f"### {t} · `{out.get('version', '')}`")
+            _sb = stockbit_url(t)
+            if _sb:
+                st.markdown(
+                    f"### {t} · `{out.get('version', '')}` · "
+                    f"[📈 Stockbit]({_sb})"
+                )
+            else:
+                st.markdown(f"### {t} · `{out.get('version', '')}`")
             if out.get("error") and not (out.get("analyses") or {}):
                 st.error(out["error"])
                 continue
@@ -1225,4 +1194,405 @@ with tab_ai:
                 st.json(ctx)
             st.markdown("---")
 
+
+# ---------- TAB 4: BACKTEST ----------
+with tab_bt:
+    st.subheader("📉 Backtest Setup Screener")
+    st.caption(
+        "Pilih ticker dari hasil report strategi → simulasi SL/TP ke depan (signal-forward). "
+        "Data history: Yahoo Finance (yfinance). Bukan jaminan hasil live."
+    )
+
+    try:
+        import idx_backtest_engine as bt_eng
+
+        BT_OK = True
+    except ImportError:
+        BT_OK = False
+        bt_eng = None
+
+    if not BT_OK:
+        st.warning(
+            "Modul `idx_backtest_engine.py` tidak ditemukan di folder project. "
+            "Salin file tersebut lalu restart Streamlit."
+        )
+    else:
+        ver_labels_bt = {
+            "v2": "V2 Breakout",
+            "v3": "V3 Retest",
+            "v4": "V4 Order Block",
+            "v5": "V5 CHOCH",
+            "intraday": "Intraday",
+            "highbeta": "HighBeta",
+            "accumulation": "Accumulation",
+            "confluence": "Confluence",
+        }
+
+        bt_c1, bt_c2 = st.columns([1, 2])
+        with bt_c1:
+            bt_version = st.selectbox(
+                "Strategi (sumber report)",
+                options=list(ver_labels_bt.keys()),
+                format_func=lambda v: ver_labels_bt.get(v, v),
+                key="bt_version",
+            )
+
+        # Ambil daftar ticker dari report (reuse AI helper jika ada)
+        tickers_bt = []
+        report_path = None
+        try:
+            report_path = bt_eng.find_report(bt_version)
+        except Exception:
+            report_path = None
+
+        try:
+            import idx_ai_assistant as _ai_for_list
+
+            tickers_bt = _ai_for_list.list_tickers_in_report(bt_version) or []
+        except Exception:
+            tickers_bt = []
+
+        if not tickers_bt and report_path:
+            try:
+                _df_bt = bt_eng.load_screener_setups(path=report_path, version=bt_version)
+                tickers_bt = (
+                    _df_bt["Ticker"].astype(str).str.upper().unique().tolist()
+                    if not _df_bt.empty
+                    else []
+                )
+            except Exception:
+                tickers_bt = []
+
+        with bt_c2:
+            if not tickers_bt:
+                st.selectbox(
+                    "Ticker",
+                    options=["(tidak ada data — jalankan screener dulu)"],
+                    disabled=True,
+                    key="bt_ticker_dummy",
+                )
+                selected_bt = []
+            else:
+                selected_bt = st.multiselect(
+                    "Ticker untuk di-backtest (maks. 10)",
+                    options=tickers_bt,
+                    default=tickers_bt[: min(3, len(tickers_bt))],
+                    max_selections=10,
+                    key="bt_tickers",
+                )
+
+        if report_path:
+            st.caption(f"Report: `{report_path}`")
+        else:
+            st.caption("Report CSV belum ditemukan untuk versi ini.")
+
+        bt_mode = st.radio(
+            "Mode backtest",
+            options=["report", "historical"],
+            format_func=lambda x: (
+                "📄 Setup dari report (1 sinyal / baris CSV)"
+                if x == "report"
+                else "📜 Historis strategi pada ticker (Phase 2)"
+            ),
+            horizontal=True,
+            key="bt_mode",
+            help=(
+                "Report: uji Entry/SL/TP di CSV. "
+                "Historis: scan ulang rule strategi di history ticker → win rate emiten×strategi."
+            ),
+        )
+        if bt_mode == "historical":
+            adapter_meta = getattr(bt_eng, "STRATEGY_ADAPTERS", {})
+            info = adapter_meta.get(bt_version, {})
+            if info.get("full"):
+                st.caption(f"Adapter **{bt_version}** = rule lengkap.")
+            else:
+                st.caption(
+                    f"Adapter **{bt_version}** masih **proxy breakout** "
+                    "(bukan rule SMC/intra penuh). V3 = rule Fibo lengkap."
+                )
+
+        st.markdown("**Parameter simulasi**")
+        p1, p2, p3, p4 = st.columns(4)
+        with p1:
+            bt_horizon = st.number_input(
+                "Horizon (hari)",
+                min_value=3,
+                max_value=60,
+                value=20,
+                step=1,
+                key="bt_horizon",
+            )
+        with p2:
+            bt_entry_mode = st.selectbox(
+                "Entry mode",
+                options=["next_open", "signal_close"],
+                format_func=lambda x: (
+                    "Open bar berikutnya" if x == "next_open" else "Close hari sinyal"
+                ),
+                key="bt_entry_mode",
+            )
+        with p3:
+            bt_priority = st.selectbox(
+                "Intrabar priority",
+                options=["sl_first", "tp_first"],
+                format_func=lambda x: (
+                    "SL dulu (konservatif)" if x == "sl_first" else "TP dulu (optimis)"
+                ),
+                key="bt_priority",
+            )
+        with p4:
+            if bt_mode == "historical":
+                bt_lookback = st.number_input(
+                    "Lookback history (hari)",
+                    min_value=120,
+                    max_value=800,
+                    value=400,
+                    step=20,
+                    key="bt_lookback",
+                )
+            else:
+                bt_tp_level = st.selectbox(
+                    "Target",
+                    options=["tp1", "tp2"],
+                    format_func=lambda x: "TP1" if x == "tp1" else "TP2 (jika ada)",
+                    key="bt_tp_level",
+                )
+                bt_lookback = 400
+
+        if bt_mode == "historical":
+            bt_tp_level = st.selectbox(
+                "Target",
+                options=["tp1", "tp2"],
+                format_func=lambda x: "TP1" if x == "tp1" else "TP2 (jika ada)",
+                key="bt_tp_level_hist",
+            )
+
+        # Historical: boleh input ticker manual jika tidak ada di report
+        if bt_mode == "historical":
+            extra_t = st.text_input(
+                "Tambah ticker manual (pisah koma)",
+                value="",
+                key="bt_extra_tickers",
+                help="Contoh: MARK,BBCA — untuk uji emiten meski tidak ada di report hari ini",
+            )
+            if extra_t.strip():
+                for x in extra_t.split(","):
+                    x = x.strip().upper().replace(".JK", "")
+                    if x and x not in selected_bt:
+                        selected_bt = list(selected_bt) + [x]
+
+        run_bt = st.button(
+            "▶️ Jalankan Backtest",
+            type="primary",
+            width="stretch",
+            disabled=not selected_bt,
+            key="bt_run_btn",
+        )
+
+        if run_bt and selected_bt:
+            bt_params = {
+                "horizon_bars": int(bt_horizon),
+                "entry_mode": bt_entry_mode,
+                "intrabar_priority": bt_priority,
+                "tp_level": bt_tp_level,
+                "account_size": float(account_size),
+                "risk_per_trade_pct": float(risk_pct),
+                "buy_fee_pct": float(broker_buy),
+                "sell_fee_pct": float(broker_sell),
+            }
+            with st.spinner(
+                f"Backtest [{bt_mode}] {', '.join(selected_bt)} · {bt_version}..."
+            ):
+                try:
+                    if bt_mode == "historical":
+                        # Kompatibel: file lama mungkin belum punya backtest_tickers_strategy
+                        batch_fn = getattr(bt_eng, "backtest_tickers_strategy", None)
+                        single_fn = getattr(bt_eng, "backtest_ticker_strategy", None)
+                        if batch_fn is None and single_fn is None:
+                            raise AttributeError(
+                                "idx_backtest_engine belum berisi Phase 2. "
+                                "Update file idx_backtest_engine.py (salin dari artifacts), "
+                                "lalu restart Streamlit / redeploy Cloud."
+                            )
+                        if batch_fn is not None:
+                            trades, summary = batch_fn(
+                                selected_bt,
+                                bt_version,
+                                lookback_days=int(bt_lookback),
+                                max_signals=30,
+                                params=bt_params,
+                            )
+                        else:
+                            # fallback: loop per ticker
+                            import pandas as _pd_hist
+
+                            _parts = []
+                            for _t in selected_bt:
+                                _tr, _sm, _ = single_fn(
+                                    _t,
+                                    bt_version,
+                                    lookback_days=int(bt_lookback),
+                                    max_signals=30,
+                                    params=bt_params,
+                                    progress=True,
+                                )
+                                if _tr is not None and not _tr.empty:
+                                    _parts.append(_tr)
+                            if _parts:
+                                trades = _pd_hist.concat(_parts, ignore_index=True)
+                                summary = bt_eng.summarize_trades(trades)
+                            else:
+                                trades = _pd_hist.DataFrame()
+                                summary = bt_eng.summarize_trades(trades)
+                        out_path = None
+                        if trades is not None and not trades.empty:
+                            out_path = (
+                                f"idx_backtest_hist_{bt_version}_"
+                                f"{datetime.now().strftime('%Y-%m-%d')}.csv"
+                            )
+                            trades.to_csv(out_path, index=False)
+                    else:
+                        trades, summary, out_path = bt_eng.backtest_report(
+                            bt_version,
+                            path=report_path,
+                            tickers=selected_bt,
+                            params=bt_params,
+                            save=True,
+                        )
+                    st.session_state["bt_results"] = {
+                        "trades": (
+                            trades.to_dict(orient="records")
+                            if trades is not None and not trades.empty
+                            else []
+                        ),
+                        "summary": summary.to_dict() if summary else {},
+                        "path": out_path,
+                        "version": bt_version,
+                        "tickers": selected_bt,
+                        "params": bt_params,
+                        "mode": bt_mode,
+                    }
+                except Exception as e:
+                    st.session_state["bt_results"] = {
+                        "error": str(e),
+                        "trades": [],
+                        "summary": {},
+                    }
+
+        bt_res = st.session_state.get("bt_results")
+        if bt_res:
+            if bt_res.get("error"):
+                st.error(bt_res["error"])
+            else:
+                sm = bt_res.get("summary") or {}
+                mode_lbl = bt_res.get("mode") or "report"
+                st.markdown(
+                    f"### Ringkasan "
+                    f"({'Historis Phase 2' if mode_lbl == 'historical' else 'Setup report'})"
+                )
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Trades", sm.get("n_trades", 0))
+                m2.metric("Win rate", f"{sm.get('win_rate', 0)}%")
+                m3.metric("Avg R", sm.get("avg_r", 0))
+                m4.metric("Expectancy R", sm.get("expectancy_r", 0))
+
+                m5, m6, m7, m8 = st.columns(4)
+                m5.metric("Profit factor", sm.get("profit_factor", 0))
+                m6.metric("PnL net (Rp)", f"{sm.get('total_pnl_net', 0):,.0f}")
+                m7.metric("Avg hold (bars)", sm.get("avg_bars_held", 0))
+                m8.metric(
+                    "Max W / L R",
+                    f"{sm.get('max_win_r', 0)} / {sm.get('max_loss_r', 0)}",
+                )
+
+                if sm.get("by_exit_reason"):
+                    st.caption(f"Exit reason: {sm.get('by_exit_reason')}")
+                if sm.get("avg_planned_rr") is not None:
+                    st.caption(
+                        f"Rata planned RR screener: {sm.get('avg_planned_rr')} "
+                        f"vs realized avg R: {sm.get('avg_r')}"
+                    )
+
+                trades_list = bt_res.get("trades") or []
+                if trades_list:
+                    import pandas as _pd_bt
+
+                    tdf = _pd_bt.DataFrame(trades_list)
+                    st.markdown("### Detail trade")
+                    if "ticker" in tdf.columns:
+                        tdf = tdf.copy()
+                        tdf.insert(
+                            0,
+                            "Stockbit",
+                            tdf["ticker"].map(stockbit_url),
+                        )
+                    show_cols = [
+                        c
+                        for c in [
+                            "Stockbit",
+                            "ticker",
+                            "strategy",
+                            "signal_date",
+                            "entry_date",
+                            "exit_date",
+                            "entry",
+                            "stop_loss",
+                            "target",
+                            "exit_price",
+                            "exit_reason",
+                            "bars_held",
+                            "r_multiple",
+                            "pnl_net",
+                            "lots",
+                            "planned_rr",
+                        ]
+                        if c in tdf.columns
+                    ]
+                    st.dataframe(
+                        tdf[show_cols],
+                        width="stretch",
+                        hide_index=True,
+                        column_config={
+                            "Stockbit": st.column_config.LinkColumn(
+                                "Stockbit",
+                                display_text="📈",
+                                help="Buka di Stockbit",
+                            )
+                        },
+                    )
+
+                    # Download CSV
+                    csv_bytes = tdf.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "⬇️ Unduh hasil backtest (.csv)",
+                        data=csv_bytes,
+                        file_name=(
+                            f"idx_backtest_{bt_res.get('version', 'x')}_"
+                            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                        ),
+                        mime="text/csv",
+                        key="bt_download_csv",
+                    )
+                    if bt_res.get("path"):
+                        st.caption(f"Server: `{bt_res['path']}`")
+                else:
+                    mode_lbl = bt_res.get("mode") or "report"
+                    if mode_lbl == "historical":
+                        st.info(
+                            "Tidak ada trade historis. Kemungkinan: "
+                            "tidak ketemu sinyal rule pada lookback, "
+                            "level Entry/SL/TP kosong setelah normalize, "
+                            "atau data yfinance gagal. Coba ticker lain / perbesar lookback."
+                        )
+                    else:
+                        st.info(
+                            "Tidak ada trade yang bisa disimulasikan. "
+                            "Cek BreakoutDay/signal date di report dan data yfinance."
+                        )
+
+                with st.expander("Parameter run", expanded=False):
+                    st.json(bt_res.get("params") or {})
+
 st.caption("IDX Master Screener AI • Bukan rekomendasi investasi")
+
