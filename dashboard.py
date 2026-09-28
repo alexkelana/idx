@@ -144,6 +144,54 @@ REPORT_VERSIONS = [
 ]
 
 # =====================================================================
+# REGIME IHSG — cache + staleness helpers
+# Setiap regime disimpan dengan timestamp JSON-safe. Tab AI Assistant
+# auto-refresh jika cache kosong / lebih tua dari TTL (default 15 menit).
+# =====================================================================
+IHSG_REGIME_TTL_SECONDS = 900  # 15 menit
+
+
+def _set_ihsg_regime(regime: dict) -> None:
+    """Simpan hasil rezim IHSG ke session_state + timestamp."""
+    regime = dict(regime or {})
+    now = datetime.now()
+    regime["fetched_at_epoch"] = now.timestamp()
+    regime["fetched_at_str"] = now.strftime("%d/%m/%Y %H:%M:%S")
+    st.session_state["ihsg_regime"] = regime
+
+
+def _ihsg_regime_age_seconds():
+    """Umur data regime (detik), atau None jika belum pernah diambil."""
+    reg = st.session_state.get("ihsg_regime") or {}
+    ts = reg.get("fetched_at_epoch")
+    if not ts:
+        return None
+    return datetime.now().timestamp() - ts
+
+
+def _ihsg_regime_is_stale(ttl: int = IHSG_REGIME_TTL_SECONDS) -> bool:
+    age = _ihsg_regime_age_seconds()
+    return age is None or age > ttl
+
+
+def _refresh_ihsg_regime() -> dict:
+    """Ambil ulang rezim IHSG live dari master_screener_ai dan cache."""
+    try:
+        import master_screener_ai
+
+        regime = master_screener_ai.analyze_ihsg_regime()
+    except Exception as e:
+        regime = {
+            "regime": "UNKNOWN",
+            "reason": [f"Gagal ambil rezim: {e}"],
+            "strategies": [],
+            "last_close": None,
+        }
+    _set_ihsg_regime(regime)
+    return st.session_state["ihsg_regime"]
+
+
+# =====================================================================
 # SIDEBAR
 # =====================================================================
 st.sidebar.header("⚙️ Modal & Risiko")
@@ -467,17 +515,7 @@ with tab_pasar:
 
     if cek_rezim:
         with st.spinner("Mengambil data IHSG..."):
-            try:
-                import master_screener_ai
-
-                st.session_state["ihsg_regime"] = master_screener_ai.analyze_ihsg_regime()
-            except Exception as e:
-                st.session_state["ihsg_regime"] = {
-                    "regime": "UNKNOWN",
-                    "reason": [str(e)],
-                    "strategies": [],
-                    "last_close": None,
-                }
+            _refresh_ihsg_regime()
 
     if "ihsg_regime" not in st.session_state:
         st.session_state["ihsg_regime"] = {
@@ -563,6 +601,23 @@ with tab_pasar:
         st.markdown(f"- {r}")
     if reg.get("strategies"):
         st.markdown(f"**Strategi disarankan:** `{', '.join(reg['strategies'])}`")
+
+    if str(regime) not in ("Belum dicek", "UNKNOWN", ""):
+        age = _ihsg_regime_age_seconds()
+        if age is not None:
+            mins = age / 60
+            if _ihsg_regime_is_stale():
+                st.warning(
+                    f"⏱️ Data rezim diambil **{reg.get('fetched_at_str', '?')}** "
+                    f"(±{mins:.0f} menit lalu) — lewat TTL "
+                    f"{IHSG_REGIME_TTL_SECONDS // 60} menit. "
+                    "Klik **Cek Rezim Sekarang** untuk data terbaru."
+                )
+            else:
+                st.caption(
+                    f"⏱️ Diambil {reg.get('fetched_at_str', '?')} "
+                    f"(±{mins:.0f} menit lalu)."
+                )
 
     st.markdown("---")
     st.markdown("##### 📰 Berita pasar (near real-time)")
@@ -754,11 +809,7 @@ with tab_screener:
                     run_ai, account_size, risk_pct, broker_buy, broker_sell
                 )
                 try:
-                    import master_screener_ai
-
-                    st.session_state["ihsg_regime"] = (
-                        master_screener_ai.analyze_ihsg_regime()
-                    )
+                    _refresh_ihsg_regime()
                 except Exception:
                     pass
             elif mode.startswith("V2"):
@@ -976,6 +1027,13 @@ with tab_ai:
         )
 
         if run_ai_btn and selected_tickers:
+            # Auto-refresh regime jika kosong / basi (TTL 15 menit)
+            if _ihsg_regime_is_stale():
+                with st.spinner(
+                    "Rezim IHSG belum ada / sudah basi — mengambil ulang sebelum analisa..."
+                ):
+                    _refresh_ihsg_regime()
+
             regime_ctx = st.session_state.get("ihsg_regime") or {}
             regime_slim = {
                 k: regime_ctx.get(k)
@@ -992,9 +1050,17 @@ with tab_ai:
                     "vol_ratio_20",
                     "range_5_pct",
                     "range_20_pct",
+                    "fetched_at_epoch",
+                    "fetched_at_str",
                 )
                 if k in regime_ctx
             }
+            if regime_slim.get("fetched_at_str"):
+                st.caption(
+                    f"🕒 Regime IHSG untuk batch analisa ini diambil pukul "
+                    f"**{regime_slim['fetched_at_str']}** — dipakai sama untuk "
+                    f"semua ticker: {', '.join(selected_tickers)}."
+                )
             results_ai = []
             with st.spinner(
                 f"Menjalankan agent untuk {', '.join(selected_tickers)}..."
