@@ -24,30 +24,6 @@ from idx_liquidity_scanner import IdxLiquidityScanner
 # =========================================================================
 # UTILITAS BEI
 # =========================================================================
-def round_to_idx_tick(price: float) -> int:
-    if pd.isna(price) or price <= 0:
-        return 0
-    price = float(price)
-    if price < 50:
-        return int(round(price))
-    price = int(round(price, 0))
-    if price < 200:
-        return price
-    elif price < 500:
-        return int(round(price / 2.0) * 2)
-    elif price < 2000:
-        return int(round(price / 5.0) * 5)
-    elif price < 5000:
-        return int(round(price / 10.0) * 10)
-    else:
-        return int(round(price / 25.0) * 25)
-
-def apply_ara_arb_limits(price: float, prev_close: float, is_target: bool) -> float:
-    limit = 0.35 if prev_close < 200 else (0.25 if prev_close <= 5000 else 0.20)
-    ara = round_to_idx_tick(prev_close * (1 + limit))
-    arb = round_to_idx_tick(prev_close * (1 - limit))
-    return min(price, ara) if is_target else max(price, arb)
-
 # =========================================================================
 # SMC ALGORITHMS (bug indexing diperbaiki)
 # =========================================================================
@@ -178,12 +154,50 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
     # Trading Plan
     entry = round_to_idx_tick(last_close)
 
-    stop_loss_raw = ob_bottom * 0.985
+    # ATR(14) untuk lantai risk — cegah RR fantasi dari SL menempel OB
+    high_s = df["High"]
+    low_s = df["Low"]
+    close_s = df["Close"]
+    prev_close = close_s.shift(1)
+    tr = pd.concat(
+        [
+            (high_s - low_s),
+            (high_s - prev_close).abs(),
+            (low_s - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = float(tr.tail(14).mean()) if len(tr) >= 14 else float(tr.mean())
+    if not atr or atr != atr or atr <= 0:
+        atr = entry * 0.02
+
+    # SL struktural di bawah OB bottom
+    stop_struct = float(ob_bottom) * 0.985
+    # Lantai napas: min(1.2% entry, 0.85×ATR) — mana yang lebih dalam
+    min_risk = max(entry * 0.012, 0.85 * atr)
+    stop_floor = entry - min_risk
+    # Plafon risk 8% (selaras exchange / V3 spirit)
+    max_risk = entry * 0.08
+    stop_cap = entry - max_risk
+
+    stop_loss_raw = min(stop_struct, stop_floor)  # lebih dalam = lebih kecil angka
+    sl_source = "structure"
+    if stop_struct > stop_floor:
+        # struktur terlalu dangkal → pakai lantai ATR/%
+        stop_loss_raw = stop_floor
+        sl_source = "ATR_floor"
+    if stop_loss_raw < stop_cap:
+        stop_loss_raw = stop_cap
+        sl_source = sl_source + "+cap"
+
     stop_loss = round_to_idx_tick(stop_loss_raw)
     stop_loss = apply_ara_arb_limits(stop_loss, last_close, is_target=False)
 
     risk_per_share = entry - stop_loss
     if risk_per_share <= 0:
+        return None
+    # Tolak jika risk masih < 0.7×ATR setelah semua clamp (noise)
+    if atr > 0 and risk_per_share < 0.7 * atr:
         return None
 
     # [FIX] Target sekarang akurat karena bos_idx absolut
@@ -191,10 +205,16 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
     target_1 = apply_ara_arb_limits(
         round_to_idx_tick(peak_after_bos), last_close, is_target=True
     )
+    if target_1 <= entry:
+        return None
 
     rr_ratio = (target_1 - entry) / risk_per_share if risk_per_share > 0 else 0
     if rr_ratio < 1.5:
         return None
+    # RR ekstrem biasanya artefak target jauh + SL residual — cap informasi
+    if rr_ratio > 6.0:
+        # masih lolos, tapi tandai di output; jangan hard-reject
+        pass
 
     # Position Sizing
     risk_rp = account_size * (risk_pct / 100.0)
@@ -204,6 +224,9 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
     est_loss = actual_shares * risk_per_share
     est_profit = actual_shares * (target_1 - entry)
 
+    risk_atr = round(risk_per_share / atr, 2) if atr > 0 else 0.0
+    risk_pct = round(risk_per_share / entry * 100, 2) if entry > 0 else 0.0
+
     return {
         "Ticker": symbol,
         "Close": round_to_idx_tick(last_close),
@@ -211,8 +234,12 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
         "OB_Bottom": round_to_idx_tick(ob_bottom),
         "Entry": entry,
         "StopLoss": stop_loss,
+        "SL_Source": sl_source,
         "Target(Liquidity)": target_1,
         "RR_Ratio": round(rr_ratio, 2),
+        "ATR": round(atr, 1),
+        "RiskATR": risk_atr,
+        "RiskPct": risk_pct,
         "Lots": lots,
         "EstLoss(Rp)": round(est_loss, 0),
         "EstProfit(Rp)": round(est_profit, 0),
@@ -274,6 +301,66 @@ def run_screener_v4(user_params: dict = None, universe=None):
     out_file = save_version_report(df_res, "v4")
     print(f"Hasil disimpan ke: {out_file}")
     return df_res
+
+# --- Exchange rules (tick + ARA/ARB BEI Sep 2026) ---
+try:
+    from idx_exchange_rules import (
+        round_to_idx_tick,
+        apply_ara_arb_limits,
+        get_ara_arb_limits,
+        DEFAULT_SCREENER_MIN_PRICE,
+        describe_rules,
+    )
+except ImportError:
+    # Fallback minimal jika modul belum ter-deploy
+    def round_to_idx_tick(price: float) -> int:
+        if price is None or price <= 0:
+            return 0
+        price = float(price)
+        if price < 50:
+            return int(round(price))
+        price = int(round(price, 0))
+        if price < 200:
+            return price
+        if price < 500:
+            return int(round(price / 2.0) * 2)
+        if price < 2000:
+            return int(round(price / 5.0) * 5)
+        if price < 5000:
+            return int(round(price / 10.0) * 10)
+        return int(round(price / 25.0) * 25)
+
+    def apply_ara_arb_limits(price: float, prev_close: float, is_target: bool) -> float:
+        pc = float(prev_close or 0)
+        if pc <= 0:
+            return float(round_to_idx_tick(price))
+        if pc <= 10:
+            ara, arb = pc + 1, max(1.0, pc - 1)
+        elif pc <= 200:
+            ara, arb = pc * 1.35, pc * 0.85
+        elif pc <= 5000:
+            ara, arb = pc * 1.25, pc * 0.85
+        else:
+            ara, arb = pc * 1.20, pc * 0.85
+        ara = float(round_to_idx_tick(ara))
+        arb = float(round_to_idx_tick(arb))
+        p = float(round_to_idx_tick(price))
+        return min(p, ara) if is_target else max(p, arb)
+
+    def get_ara_arb_limits(prev_close, asof=None):
+        pc = float(prev_close or 0)
+        if pc <= 10:
+            return pc + 1, max(1.0, pc - 1), "fallback_1_10"
+        if pc <= 200:
+            return pc * 1.35, pc * 0.85, "fallback"
+        if pc <= 5000:
+            return pc * 1.25, pc * 0.85, "fallback"
+        return pc * 1.20, pc * 0.85, "fallback"
+
+    DEFAULT_SCREENER_MIN_PRICE = 50.0
+
+    def describe_rules(asof=None):
+        return "fallback local ARA/ARB"
 
 if __name__ == "__main__":
     run_screener_v4()

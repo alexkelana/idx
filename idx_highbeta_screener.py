@@ -27,6 +27,66 @@ try:
 except ImportError:
     IdxLiquidityScanner = None
 
+# --- Exchange rules (tick + ARA/ARB BEI Sep 2026) ---
+try:
+    from idx_exchange_rules import (
+        round_to_idx_tick,
+        apply_ara_arb_limits,
+        get_ara_arb_limits,
+        DEFAULT_SCREENER_MIN_PRICE,
+        describe_rules,
+    )
+except ImportError:
+    # Fallback minimal jika modul belum ter-deploy
+    def round_to_idx_tick(price: float) -> int:
+        if price is None or price <= 0:
+            return 0
+        price = float(price)
+        if price < 50:
+            return int(round(price))
+        price = int(round(price, 0))
+        if price < 200:
+            return price
+        if price < 500:
+            return int(round(price / 2.0) * 2)
+        if price < 2000:
+            return int(round(price / 5.0) * 5)
+        if price < 5000:
+            return int(round(price / 10.0) * 10)
+        return int(round(price / 25.0) * 25)
+
+    def apply_ara_arb_limits(price: float, prev_close: float, is_target: bool) -> float:
+        pc = float(prev_close or 0)
+        if pc <= 0:
+            return float(round_to_idx_tick(price))
+        if pc <= 10:
+            ara, arb = pc + 1, max(1.0, pc - 1)
+        elif pc <= 200:
+            ara, arb = pc * 1.35, pc * 0.85
+        elif pc <= 5000:
+            ara, arb = pc * 1.25, pc * 0.85
+        else:
+            ara, arb = pc * 1.20, pc * 0.85
+        ara = float(round_to_idx_tick(ara))
+        arb = float(round_to_idx_tick(arb))
+        p = float(round_to_idx_tick(price))
+        return min(p, ara) if is_target else max(p, arb)
+
+    def get_ara_arb_limits(prev_close, asof=None):
+        pc = float(prev_close or 0)
+        if pc <= 10:
+            return pc + 1, max(1.0, pc - 1), "fallback_1_10"
+        if pc <= 200:
+            return pc * 1.35, pc * 0.85, "fallback"
+        if pc <= 5000:
+            return pc * 1.25, pc * 0.85, "fallback"
+        return pc * 1.20, pc * 0.85, "fallback"
+
+    DEFAULT_SCREENER_MIN_PRICE = 50.0
+
+    def describe_rules(asof=None):
+        return "fallback local ARA/ARB"
+
 PARAMS = {
     "min_avg_value_rp": 30_000_000_000,
     "min_avg_volume": 5_000_000,
@@ -50,31 +110,6 @@ PARAMS = {
     "top_n": 20,
     "min_score": 50,
 }
-
-
-def round_to_idx_tick(price: float) -> int:
-    if pd.isna(price) or price <= 0:
-        return 0
-    price = float(price)
-    if price < 50:
-        return int(round(price))
-    price = int(round(price, 0))
-    if price < 200:
-        return price
-    if price < 500:
-        return int(round(price / 2.0) * 2)
-    if price < 2000:
-        return int(round(price / 5.0) * 5)
-    if price < 5000:
-        return int(round(price / 10.0) * 10)
-    return int(round(price / 25.0) * 25)
-
-
-def apply_ara_arb_limits(price: float, prev_close: float, is_target: bool) -> float:
-    limit = 0.35 if prev_close < 200 else (0.25 if prev_close <= 5000 else 0.20)
-    ara = round_to_idx_tick(prev_close * (1 + limit))
-    arb = round_to_idx_tick(prev_close * (1 - limit))
-    return min(price, ara) if is_target else max(price, arb)
 
 
 def compute_rsi(close: pd.Series, period: int = 14) -> float:

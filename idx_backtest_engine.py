@@ -31,6 +31,26 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
+try:
+    from idx_exchange_rules import round_to_idx_tick as _round_tick
+except ImportError:
+    def _legacy_round_tick_UNUSED(price: float) -> float:
+        if price is None or price <= 0:
+            return 0
+        price = float(price)
+        if price < 50:
+            return int(round(price))
+        price = int(round(price, 0))
+        if price < 200:
+            return price
+        if price < 500:
+            return int(round(price / 2.0) * 2)
+        if price < 2000:
+            return int(round(price / 5.0) * 5)
+        if price < 5000:
+            return int(round(price / 10.0) * 10)
+        return int(round(price / 25.0) * 25)
+
 import pandas as pd
 
 try:
@@ -733,20 +753,6 @@ def _download_history(ticker: str, lookback_days: int = 500) -> pd.DataFrame:
     )
     return _prep_ohlcv_df(df)
 
-
-def _round_tick(price: float) -> float:
-    if price is None or price != price or price <= 0:
-        return 0.0
-    p = float(price)
-    if p < 200:
-        return float(int(round(p)))
-    if p < 500:
-        return float(int(round(p / 2) * 2))
-    if p < 2000:
-        return float(int(round(p / 5) * 5))
-    if p < 5000:
-        return float(int(round(p / 10) * 10))
-    return float(int(round(p / 25) * 25))
 
 
 def _atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:

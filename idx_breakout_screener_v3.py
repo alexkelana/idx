@@ -47,33 +47,14 @@ PARAMS = {
     "regime_mode": "relaxed",
     "require_retest_touch": False,
     "retest_wick_min_pct": 0.15,
-    "min_score": 35,
+    "min_score": 40,
+    # Scoring freshness / trend strength
+    "score_bo_fresh_max_days": 5,
+    "score_bo_stale_days": 10,
+    "score_adx_strong": 25.0,
+    "score_adx_moderate": 18.0,
+    "score_adx_weak": 15.0,
 }
-
-
-def round_to_idx_tick(price: float) -> int:
-    if pd.isna(price) or price <= 0:
-        return 0
-    price = float(price)
-    if price < 50:
-        return int(round(price))
-    price = int(round(price, 0))
-    if price < 200:
-        return price
-    if price < 500:
-        return int(round(price / 2.0) * 2)
-    if price < 2000:
-        return int(round(price / 5.0) * 5)
-    if price < 5000:
-        return int(round(price / 10.0) * 10)
-    return int(round(price / 25.0) * 25)
-
-
-def apply_ara_arb_limits(price: float, prev_close: float, is_target: bool) -> float:
-    limit = 0.35 if prev_close < 200 else (0.25 if prev_close <= 5000 else 0.20)
-    ara = round_to_idx_tick(prev_close * (1 + limit))
-    arb = round_to_idx_tick(prev_close * (1 - limit))
-    return min(price, ara) if is_target else max(price, arb)
 
 
 def trade_net_pnl(entry: float, exit_price: float, shares: int, params: dict) -> float:
@@ -126,11 +107,47 @@ def compute_roc(series: pd.Series, period: int = 10) -> pd.Series:
     return series.pct_change(periods=period) * 100
 
 
-def quality_tier(score: int, rr: float, retest_ok: bool, vol_valid: bool) -> str:
-    if score >= 70 and rr >= 1.5 and retest_ok and vol_valid:
+def quality_tier(
+    score: int,
+    rr: float,
+    retest_ok: bool,
+    vol_valid: bool,
+    *,
+    days_since_bo: int = 0,
+    adx: float = 0.0,
+    reversal: bool = False,
+) -> str:
+    """
+    Tier kualitas setup (A / B+ / B / C / D).
+    Memisahkan score tinggi+fresh (A) dari score tinggi tapi basi, dan
+    score menengah tanpa ADX (C) dari B yang lebih solid.
+    """
+    fresh = days_since_bo <= 5
+    strong_trend = adx >= 25
+    ok_trend = adx >= 18
+
+    if (
+        score >= 80
+        and rr >= 1.5
+        and retest_ok
+        and vol_valid
+        and fresh
+        and strong_trend
+    ):
         return "A"
-    if score >= 50 and rr >= 1.2 and retest_ok:
+    if (
+        score >= 70
+        and rr >= 1.4
+        and retest_ok
+        and vol_valid
+        and (fresh or strong_trend)
+        and ok_trend
+    ):
+        return "B+"
+    if score >= 55 and rr >= 1.3 and retest_ok and ok_trend:
         return "B"
+    if score >= 45 and rr >= 1.2 and retest_ok:
+        return "B" if (vol_valid or reversal) else "C"
     if score >= 35:
         return "C"
     return "D"
@@ -229,6 +246,66 @@ def get_dynamic_liquidity_universe() -> list:
     print("=" * 60)
     return universe
 
+
+# --- Exchange rules (tick + ARA/ARB BEI Sep 2026) ---
+try:
+    from idx_exchange_rules import (
+        round_to_idx_tick,
+        apply_ara_arb_limits,
+        get_ara_arb_limits,
+        DEFAULT_SCREENER_MIN_PRICE,
+        describe_rules,
+    )
+except ImportError:
+    # Fallback minimal jika modul belum ter-deploy
+    def round_to_idx_tick(price: float) -> int:
+        if price is None or price <= 0:
+            return 0
+        price = float(price)
+        if price < 50:
+            return int(round(price))
+        price = int(round(price, 0))
+        if price < 200:
+            return price
+        if price < 500:
+            return int(round(price / 2.0) * 2)
+        if price < 2000:
+            return int(round(price / 5.0) * 5)
+        if price < 5000:
+            return int(round(price / 10.0) * 10)
+        return int(round(price / 25.0) * 25)
+
+    def apply_ara_arb_limits(price: float, prev_close: float, is_target: bool) -> float:
+        pc = float(prev_close or 0)
+        if pc <= 0:
+            return float(round_to_idx_tick(price))
+        if pc <= 10:
+            ara, arb = pc + 1, max(1.0, pc - 1)
+        elif pc <= 200:
+            ara, arb = pc * 1.35, pc * 0.85
+        elif pc <= 5000:
+            ara, arb = pc * 1.25, pc * 0.85
+        else:
+            ara, arb = pc * 1.20, pc * 0.85
+        ara = float(round_to_idx_tick(ara))
+        arb = float(round_to_idx_tick(arb))
+        p = float(round_to_idx_tick(price))
+        return min(p, ara) if is_target else max(p, arb)
+
+    def get_ara_arb_limits(prev_close, asof=None):
+        pc = float(prev_close or 0)
+        if pc <= 10:
+            return pc + 1, max(1.0, pc - 1), "fallback_1_10"
+        if pc <= 200:
+            return pc * 1.35, pc * 0.85, "fallback"
+        if pc <= 5000:
+            return pc * 1.25, pc * 0.85, "fallback"
+        return pc * 1.20, pc * 0.85, "fallback"
+
+    DEFAULT_SCREENER_MIN_PRICE = 50.0
+
+    def describe_rules(asof=None):
+        return "fallback local ARA/ARB"
 
 def check_weekly_regime(df: pd.DataFrame, mode: str) -> tuple[bool, str]:
     weekly = (
@@ -421,44 +498,104 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     is_vol_up = last_vol > prev_vol
     reversal_signal = is_bullish_candle and is_vol_up
 
-    score = 15
+    # ------------------------------------------------------------------
+    # Scoring (disesuaikan: freshness BO + ADX + penalti setup basi)
+    # Base lebih rendah agar penalti/bonus benar-benar memisahkan kualitas
+    # ------------------------------------------------------------------
+    score = 10
     reasons = [regime_label]
+
+    adx_strong = float(params.get("score_adx_strong", 25.0))
+    adx_mod = float(params.get("score_adx_moderate", 18.0))
+    adx_weak = float(params.get("score_adx_weak", 15.0))
+    fresh_max = int(params.get("score_bo_fresh_max_days", 5))
+    stale_days = int(params.get("score_bo_stale_days", 10))
 
     if retest_ok:
         score += 15
         reasons.append("Retest hold/reject")
+    else:
+        score -= 5
+        reasons.append("Retest lemah")
+
     if is_vol_valid:
         score += 15
         reasons.append("Vol Koreksi Rendah")
     elif vol_rising_correction:
-        score -= 8
+        score -= 10
         reasons.append("Vol koreksi tinggi (risiko)")
-    if curr_adx > 25 and curr_pdi > curr_mdi:
+
+    # ADX: bonus berjenjang + penalti trend lemah
+    if curr_adx >= adx_strong and curr_pdi > curr_mdi:
         score += 15
         reasons.append(f"ADX Kuat ({curr_adx:.1f})")
-    elif curr_adx > 18 and curr_pdi > curr_mdi:
+    elif curr_adx >= adx_mod and curr_pdi > curr_mdi:
         score += 8
         reasons.append(f"ADX Moderat ({curr_adx:.1f})")
-    if roc > 0:
-        score += 8
+    elif curr_adx >= adx_mod and curr_pdi <= curr_mdi:
+        score -= 4
+        reasons.append(f"ADX ok tapi -DI dominan ({curr_adx:.1f})")
+    elif curr_adx < adx_weak:
+        score -= 12
+        reasons.append(f"ADX Lemah ({curr_adx:.1f})")
+    else:
+        # 15–18: netral-lemah
+        score -= 6
+        reasons.append(f"ADX Tipis ({curr_adx:.1f})")
+
+    if roc > 2:
+        score += 10
+        reasons.append(f"ROC kuat ({roc:.1f})")
+    elif roc > 0:
+        score += 6
         reasons.append("ROC Positif")
+    elif roc < -2:
+        score -= 6
+        reasons.append(f"ROC negatif ({roc:.1f})")
+
     if fib_618 <= last_close <= fib_382:
         score += 12
         reasons.append("Fibo Golden 38-62")
     elif in_fibo_zone:
         score += 6
         reasons.append("Fibo Zone 24-62")
+    else:
+        score -= 3
+        reasons.append("Di luar zona Fibo ideal")
+
     if reversal_signal:
         score += 12
         reasons.append("Reversal Candle")
+
     if above_ma20:
         score += 8
         reasons.append("Close>MA20")
-    if days_since_bo <= 5:
-        score += 5
-        reasons.append(f"BO fresh ({days_since_bo}d)")
+    else:
+        score -= 5
+        reasons.append("Close<MA20")
 
-    if score < int(params.get("min_score", 35)):
+    # Freshness breakout — pembeda utama MARK(9d) vs SMIL(14d) vs BO baru
+    if days_since_bo <= 2:
+        score += 12
+        reasons.append(f"BO sangat fresh ({days_since_bo}d)")
+    elif days_since_bo <= fresh_max:
+        score += 6
+        reasons.append(f"BO fresh ({days_since_bo}d)")
+    elif days_since_bo <= stale_days:
+        score -= 6
+        reasons.append(f"BO menua ({days_since_bo}d)")
+    else:
+        score -= 14
+        reasons.append(f"BO basi ({days_since_bo}d)")
+
+    # Soft cap: setup sangat basi + ADX lemah jarang layak
+    if days_since_bo > stale_days and curr_adx < adx_mod:
+        score -= 5
+        reasons.append("Penalti ganda: basi + ADX lemah")
+
+    score = int(max(0, min(score, 100)))
+
+    if score < int(params.get("min_score", 40)):
         return None
 
     entry = round_to_idx_tick(last_close)
@@ -511,7 +648,15 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     net_tp1 = trade_net_pnl(entry, target_1, shares, params)
     net_tp2 = trade_net_pnl(entry, target_2, shares, params)
 
-    q = quality_tier(score, rr_ratio, retest_ok, is_vol_valid)
+    q = quality_tier(
+        score,
+        rr_ratio,
+        retest_ok,
+        is_vol_valid,
+        days_since_bo=days_since_bo,
+        adx=curr_adx,
+        reversal=reversal_signal,
+    )
 
     return {
         "Ticker": sym,
@@ -583,7 +728,7 @@ def run_screener(universe=None, params=None):
         return pd.DataFrame()
 
     df_result = pd.DataFrame(results)
-    order = {"A": 0, "B": 1, "C": 2, "D": 3}
+    order = {"A": 0, "B+": 1, "B": 2, "C": 3, "D": 4}
     df_result["_q"] = df_result["Quality"].map(lambda x: order.get(x, 9))
     df_result = (
         df_result.sort_values(
