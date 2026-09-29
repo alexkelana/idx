@@ -213,7 +213,7 @@ def build_facts(context: dict) -> dict[str, Any]:
     else:
         reg_label = str(reg_label).upper()
 
-    return {
+    facts_base = {
         "ticker": context.get("ticker"),
         "screener_version": context.get("screener_version"),
         "close": close,
@@ -250,6 +250,25 @@ def build_facts(context: dict) -> dict[str, Any]:
         "ihsg_regime_raw": reg_label,
         "ihsg_last_close": _fnum(regime.get("last_close")) if isinstance(regime, dict) else None,
     }
+    # Rezim emiten (terpisah dari IHSG)
+    tr = derive_ticker_regime(facts_base, ma)
+    facts_base.update(tr)
+    # pre-computed object for prompts / context
+    facts_base["ticker_regime_detail"] = {
+        "regime": tr.get("ticker_regime"),
+        "strength": tr.get("ticker_regime_strength"),
+        "summary": tr.get("ticker_regime_summary"),
+        "notes": tr.get("ticker_regime_notes"),
+        "above_ma50": tr.get("above_ma50"),
+        "above_ma200": tr.get("above_ma200"),
+        "ma20_50_cross": tr.get("ma20_50_cross"),
+        "ma20_50_cross_days": tr.get("ma20_50_cross_days"),
+        "_note": (
+            "Rezim EMITEN dari MA/ADX/ROC. "
+            "Jangan samakan dengan regime IHSG (market_regime)."
+        ),
+    }
+    return facts_base
 
 
 def _classify_fib_distance(close, level, atr, p=ENGINE_PARAMS) -> tuple[str | None, float | None]:
@@ -317,6 +336,108 @@ def _trend_from_ma(facts: dict) -> str:
     if below >= 3:
         return "BEARISH"
     return "NEUTRAL"
+
+
+
+def derive_ticker_regime(facts: dict, ma_structure: dict | None = None) -> dict:
+    """
+    Rezim **emiten** (bukan IHSG): dari MA stack, posisi harga, cross, ADX/ROC screener.
+    Output dipakai engine + prompt — dipisah tegas dari market_regime IHSG.
+    """
+    ma = ma_structure or {}
+    c = facts.get("close")
+    m20, m50 = facts.get("ma20"), facts.get("ma50")
+    m100, m200 = facts.get("ma100"), facts.get("ma200")
+    adx = facts.get("adx")
+    roc = facts.get("roc")
+
+    label = "UNKNOWN"
+    strength = "UNKNOWN"
+    notes: list[str] = []
+
+    trend = _trend_from_ma(facts)
+    if trend == "BULLISH":
+        label = "BULLISH"
+    elif trend == "BEARISH":
+        label = "BEARISH"
+    elif trend == "NEUTRAL":
+        label = "NEUTRAL"
+
+    # Perkuat dari stack MA di ma_structure
+    stack = ma.get("stack") or []
+    stack_txt = " ".join(str(x) for x in stack).lower()
+    if "bullish" in stack_txt and label != "BEARISH":
+        label = "BULLISH"
+        notes.append("Susunan MA bullish")
+    elif "bearish" in stack_txt and label != "BULLISH":
+        label = "BEARISH"
+        notes.append("Susunan MA bearish")
+    elif "campur" in stack_txt or "rotasi" in stack_txt:
+        if label == "UNKNOWN":
+            label = "NEUTRAL"
+        notes.append("Susunan MA campur/rotasi")
+
+    # Cross freshness
+    crosses = ma.get("crosses") or {}
+    cx2050 = crosses.get("MA20_vs_MA50") or {}
+    direction = (cx2050.get("direction_last_cross") or "").lower()
+    days = cx2050.get("days_since_cross")
+    if direction == "golden":
+        notes.append(
+            f"Golden MA20/50"
+            + (f" ({days}d lalu)" if days is not None else "")
+        )
+        if label == "NEUTRAL":
+            label = "BULLISH"
+    elif direction == "death":
+        notes.append(
+            f"Death MA20/50"
+            + (f" ({days}d lalu)" if days is not None else "")
+        )
+        if label == "NEUTRAL":
+            label = "BEARISH"
+
+    # Strength dari ADX + posisi vs MA50/200
+    above_50 = m50 is not None and c is not None and c > m50
+    above_200 = m200 is not None and c is not None and c > m200
+    if adx is not None and adx >= 25 and label in ("BULLISH", "BEARISH"):
+        strength = "STRONG"
+        notes.append(f"ADX kuat ({adx})")
+    elif adx is not None and adx >= 18:
+        strength = "MODERATE"
+        notes.append(f"ADX moderat ({adx})")
+    elif adx is not None:
+        strength = "WEAK"
+        notes.append(f"ADX lemah ({adx})")
+    else:
+        strength = "UNKNOWN"
+
+    if roc is not None:
+        if roc > 2:
+            notes.append(f"ROC+ ({roc})")
+        elif roc < -2:
+            notes.append(f"ROC- ({roc})")
+
+    if above_50 and above_200 and label == "BULLISH":
+        notes.append("Harga di atas MA50 & MA200")
+    elif (not above_50) and m50 is not None and label == "BEARISH":
+        notes.append("Harga di bawah MA50")
+
+    # Align with IHSG later in signals
+    summary = f"{label}" + (f"/{strength}" if strength != "UNKNOWN" else "")
+    if notes:
+        summary += " — " + "; ".join(notes[:4])
+
+    return {
+        "ticker_regime": label,
+        "ticker_regime_strength": strength,
+        "ticker_regime_notes": notes[:6],
+        "ticker_regime_summary": summary,
+        "above_ma50": above_50 if m50 is not None else None,
+        "above_ma200": above_200 if m200 is not None else None,
+        "ma20_50_cross": direction or None,
+        "ma20_50_cross_days": days,
+    }
 
 
 def _pe_class(pe, p=ENGINE_PARAMS) -> str:
@@ -494,6 +615,41 @@ def build_signals(facts: dict, p: dict | None = None) -> dict[str, Any]:
             f"Account risk={acct_risk}% vs cfg; volatility (ATR/price)={vol_risk}%. "
             "Critic fokus setup/market; Risk role fokus account+fee."
         ),
+        # --- Ticker regime (emiten) vs IHSG ---
+        "ticker_regime": facts.get("ticker_regime") or "UNKNOWN",
+        "ticker_regime_strength": facts.get("ticker_regime_strength") or "UNKNOWN",
+        "ticker_regime_summary": facts.get("ticker_regime_summary") or "",
+        "ticker_regime_notes": facts.get("ticker_regime_notes") or [],
+        "regime_alignment": (
+            "ALIGNED"
+            if (facts.get("ticker_regime") in ("BULLISH", "BEARISH")
+                and market == facts.get("ticker_regime"))
+            else (
+                "CONFLICT"
+                if (
+                    facts.get("ticker_regime") in ("BULLISH", "BEARISH")
+                    and market in ("BULLISH", "BEARISH")
+                    and market != facts.get("ticker_regime")
+                )
+                else "NEUTRAL"
+            )
+        ),
+        "regime_alignment_note": (
+            "Rezim emiten searah IHSG — tailwind konteks."
+            if (
+                facts.get("ticker_regime") in ("BULLISH", "BEARISH")
+                and market == facts.get("ticker_regime")
+            )
+            else (
+                "Rezim emiten berlawanan IHSG — size lebih hati-hati / butuh konfirmasi."
+                if (
+                    facts.get("ticker_regime") in ("BULLISH", "BEARISH")
+                    and market in ("BULLISH", "BEARISH")
+                    and market != facts.get("ticker_regime")
+                )
+                else "Alignment netral (salah satu UNKNOWN/NEUTRAL)."
+            )
+        ),
     }
 
 
@@ -571,7 +727,7 @@ def build_scores(signals: dict, facts: dict, p: dict | None = None) -> dict[str,
             risk_s -= 12
     risk_s = max(0, min(100, risk_s))
 
-    # Market: UNKNOWN → 0 adjustment (score 50)
+    # Market IHSG: UNKNOWN → 0 adjustment (score 50)
     mr = signals.get("market_regime")
     if mr == "BULLISH":
         mkt = 65.0
@@ -581,6 +737,13 @@ def build_scores(signals: dict, facts: dict, p: dict | None = None) -> dict[str,
         mkt = 50.0
     else:
         mkt = 50.0  # UNKNOWN
+
+    # Alignment emiten vs IHSG (penyesuaian ringan, bukan driver utama)
+    align = signals.get("regime_alignment")
+    if align == "ALIGNED":
+        mkt = min(100.0, mkt + 5)
+    elif align == "CONFLICT":
+        mkt = max(0.0, mkt - 8)
 
     catalyst = 50.0  # news not scored hard without structured tone
 
@@ -665,8 +828,10 @@ def render_engine_scorecard(engine: dict, ticker: str = "TICKER") -> str:
     lines = [
         f"### SCORECARD ENGINE — {t} (deterministik, jangan diubah)",
         f"- Teknikal: {_dir(sig.get('trend_signal'))} {sc.get('technical_score')}%",
+        f"- Rezim emiten: {sig.get('ticker_regime')} ({sig.get('ticker_regime_strength')}) — {sig.get('ticker_regime_summary')}",
         f"- Fundamental: {_dir('BULLISH' if sig.get('roe_class')=='STRONG' and sig.get('valuation_signal')!='PREMIUM_BOTH' else 'NEUTRAL')} {sc.get('fundamental_score')}%",
         f"- Pasar IHSG: {sig.get('market_regime')} {sc.get('market_score')}% — {sig.get('market_note')}",
+        f"- Alignment emiten↔IHSG: {sig.get('regime_alignment')} — {sig.get('regime_alignment_note')}",
         f"- **Final: {sc.get('final_score')}/100** · stance: **{engine.get('stance')}**",
         f"- R:R headline: {sig.get('rr_headline')}",
         f"- Fibo: {sig.get('fib_signal')} (dist {sig.get('fib_distance_atr')} ATR) — {sig.get('fib_note')}",
@@ -708,6 +873,195 @@ def run_analysis_engine(context: dict, params: dict | None = None) -> dict[str, 
     return eng
 
 
+
+# Tesis + invalidation per strategy — critic/chief harus koheren dengan ini
+STRATEGY_PLAYBOOK = {
+    "v2": {
+        "name": "Breakout V2",
+        "thesis": "Breakout resistance dengan konfirmasi volume/momentum; ideal ada sweep di resistance lalu reclaim.",
+        "must_have": ["level breakout jelas", "entry dekat break", "RR masuk akal"],
+        "invalidation": [
+            "Close kembali di bawah level breakout (failed breakout)",
+            "Volume break lemah vs rata-rata",
+            "Tidak ada follow-through 1–3 bar setelah BO",
+            "SL terlalu ketat di noise / terlalu jauh tanpa struktur",
+        ],
+        "not_red_flag": [
+            "Tidak ada field retest (UNKNOWN) — normal di V2",
+            "Fibo tidak wajib untuk V2",
+            "Fundamental mahal tidak membatalkan breakout harian",
+        ],
+        "critic_focus": "false breakout, reclaim gagal, volume, jarak SL vs ATR",
+    },
+    "v3": {
+        "name": "Breakout+Fibo/Retest V3",
+        "thesis": "Breakout atau zona Fibo dengan kualitas retest, ADX, freshness DaysSinceBO.",
+        "must_have": ["struktur BO/retest", "RR ≥ floor", "score quality"],
+        "invalidation": [
+            "FAILED_RETEST / breakdown level",
+            "Setup basi (DaysSinceBO besar) + ADX lemah",
+            "Harga jauh dari zona Fibo relevan (FAR) tanpa momentum",
+            "RiskATR ekstrem atau SL di luar napas volatilitas",
+        ],
+        "not_red_flag": [
+            "NO_RETEST = belum uji, bukan gagal",
+            "AT_LEVEL Fibo ≠ resistance rejection otomatis",
+        ],
+        "critic_focus": "retest status, freshness BO, ADX, Fibo distance ATR, SL breathing room",
+    },
+    "v4": {
+        "name": "SMC Order Block V4",
+        "thesis": "Mitigasi order block + BOS menuju target likuiditas; entry di zona OB.",
+        "must_have": ["OB valid", "BOS/struktur", "target liquidity", "RR floor"],
+        "invalidation": [
+            "Close menembus invalidasi OB (di bawah OB bottom / SL struktural)",
+            "OB terlalu tua tanpa reaksi harga",
+            "Target liquidity sudah di-sweep / tidak relevan",
+            "SL jauh dari struktur tanpa ATR floor — risk tidak proporsional",
+            "Mitigasi > toleransi (harga tidak menghargai OB)",
+        ],
+        "not_red_flag": [
+            "Tidak ada RetestOK field (bukan V3)",
+            "Fundamental premium tidak membatalkan setup SMC harian",
+            "Tanpa sweep low tidak selalu fatal jika BOS kuat",
+        ],
+        "critic_focus": "validitas OB, usia OB, jarak entry–OB, target liquidity, RiskATR/SL source",
+    },
+    "v5": {
+        "name": "SMC CHOCH + Discount V5",
+        "thesis": "Change of character bullish lalu entry di zona discount Fibo menuju peak.",
+        "must_have": ["CHOCH fresh", "harga di discount", "RR ≥ 1.5", "target peak"],
+        "invalidation": [
+            "CHOCH basi (age tinggi) tanpa struktur baru",
+            "Harga keluar discount / breakdown di bawah lowest_low",
+            "RR tipis setelah fee pada risk lebar",
+            "Tidak ada sweep low saat require_sweep aktif / skor mengandalkan sweep",
+            "Peak target sudah jauh / liquidity sudah diambil",
+        ],
+        "not_red_flag": [
+            "NO_RETEST / tanpa field retest — normal V5",
+            "Deep discount di Fibo50 borderline bukan otomatis gagal",
+            "Overvalued fundamental — sekunder untuk swing SMC pendek",
+        ],
+        "critic_focus": "CHOCH age, posisi vs Fibo discount, sweep low, lebar SL vs RR, peak target",
+    },
+    "intraday": {
+        "name": "Intraday",
+        "thesis": "Setup satu hari: momentum/level dengan RR konservatif tercapai intraday; patuhi ARA/ARB.",
+        "must_have": ["target realistis 1 hari", "SL dalam range harian", "likuiditas"],
+        "invalidation": [
+            "Target di luar jangkauan range/ATR harian",
+            "SL terlalu lebar untuk holding intraday",
+            "Volume/likuiditas tipis (slippage)",
+            "Melawan bias sesi tanpa edge",
+        ],
+        "not_red_flag": [
+            "Fundamental jangka panjang kurang relevan",
+            "Tidak ada weekly retest",
+        ],
+        "critic_focus": "keterjangkauan TP 1 hari, fee vs edge, likuiditas, ARA/ARB",
+    },
+    "highbeta": {
+        "name": "High Beta",
+        "thesis": "Saham beta/volatilitas tinggi dengan ekspansi range; size kecil wajib.",
+        "must_have": ["volatilitas terkonfirmasi", "RR setelah gap risk", "size disiplin"],
+        "invalidation": [
+            "Gap risk menghapus SL",
+            "Size terlalu besar vs ATR%",
+            "Likuiditas tidak mendukung exit cepat",
+            "Tidak ada katalis/momentum saat vol tinggi (chop)",
+        ],
+        "not_red_flag": [
+            "Fundamental lemah sering normal di high-beta spekulatif",
+            "RR screener tinggi bisa ilusi jika SL ketat noise",
+        ],
+        "critic_focus": "ATR%, gap, size, likuiditas exit, false RR",
+    },
+    "accumulation": {
+        "name": "Accumulation",
+        "thesis": "Fase akumulasi mendekati selesai: range ketat, spring/sweep low, siap ekspansi.",
+        "must_have": ["tanda akhir akumulasi", "support/sweep", "risiko breakdown range"],
+        "invalidation": [
+            "Breakdown di bawah range akumulasi",
+            "Volume distribusi (supply) bukan demand",
+            "Belum selesai akumulasi — terlalu dini",
+            "Tidak ada sweep/spring saat thesis mengandalkannya",
+        ],
+        "not_red_flag": [
+            "Momentum ROC rendah di dalam range — sering normal",
+            "Belum breakout — thesis-nya pra-break",
+        ],
+        "critic_focus": "validitas fase akumulasi, spring/sweep, risiko breakdown, timing terlalu dini",
+    },
+}
+
+
+def _normalize_strategy_key(version: str | None) -> str:
+    v = str(version or "").strip().lower().replace(" ", "")
+    aliases = {
+        "v2": "v2",
+        "breakout": "v2",
+        "breakoutv2": "v2",
+        "v3": "v3",
+        "v4": "v4",
+        "v4_smc": "v4",
+        "smc": "v4",
+        "orderblock": "v4",
+        "v5": "v5",
+        "v5_smc": "v5",
+        "choch": "v5",
+        "intraday": "intraday",
+        "vintraday": "intraday",
+        "highbeta": "highbeta",
+        "hb": "highbeta",
+        "accumulation": "accumulation",
+        "acc": "accumulation",
+    }
+    if v in aliases:
+        return aliases[v]
+    for key in ("v2", "v3", "v4", "v5", "intraday", "highbeta", "accumulation"):
+        if key in v:
+            return key
+    return v or "unknown"
+
+
+def get_strategy_playbook(version: str | None) -> dict:
+    key = _normalize_strategy_key(version)
+    base = STRATEGY_PLAYBOOK.get(key)
+    if base:
+        return {"key": key, **base}
+    return {
+        "key": key or "unknown",
+        "name": str(version or "unknown"),
+        "thesis": "Strategy tidak dikenali — kritik hanya dari engine + screener_row.",
+        "must_have": [],
+        "invalidation": ["Data setup tidak lengkap", "RR/SL tidak koheren"],
+        "not_red_flag": [],
+        "critic_focus": "koherensi entry-SL-TP, data quality, alignment rezim",
+    }
+
+
+def build_critic_system_prompt(version: str | None) -> str:
+    """Prompt critic + lampiran playbook strategy aktif."""
+    pb = get_strategy_playbook(version)
+    base = SYSTEM_PROMPTS["critic"]
+    extra = f"""
+
+STRATEGY AKTIF: {pb.get('name')} (key={pb.get('key')})
+Thesis: {pb.get('thesis')}
+Must-have: {', '.join(pb.get('must_have') or []) or '-'}
+Invalidation spesifik:
+""" + "\n".join(f"- {x}" for x in (pb.get("invalidation") or [])) + f"""
+
+BUKAN red flag untuk strategy ini:
+""" + "\n".join(f"- {x}" for x in (pb.get("not_red_flag") or [])) + f"""
+
+Fokus critic: {pb.get('critic_focus')}
+JANGAN menerapkan invalidation strategy lain (mis. tuntut CHOCH saat V2, atau RetestOK saat V5).
+"""
+    return base + extra
+
+
 SYSTEM_PROMPTS = {
     "technical": """Kamu adalah analis teknikal IDX. Hanya data JSON. Jangan mengarang.
 
@@ -720,11 +1074,13 @@ UTAMAKAN field **engine.signals** dan **engine.facts** (deterministik):
 - fib_signal AT_LEVEL / NEAR_LEVEL: jangan red-flag hanya karena close < fib382
   jika fib_distance_atr kecil (dekat level)
 
-PISAHKAN:
-A) Tren **emiten** (engine + ma_structure)
-B) Regime **IHSG** (engine.signals.market_regime) — last_close indeks bukan harga saham
+PISAHKAN (wajib, dua blok terpisah):
+A) **Rezim emiten** — engine.signals.ticker_regime / ticker_regime_summary / ma_structure
+   (MA stack, golden/death cross emiten, ADX/ROC)
+B) **Regime IHSG** — engine.signals.market_regime — last_close = level INDEKS, bukan harga saham
+C) **Alignment** — engine.signals.regime_alignment (ALIGNED|CONFLICT|NEUTRAL)
 
-LARANGAN: PE/PB/valuasi; menyamakan MA IHSG dengan MA emiten.
+LARANGAN: PE/PB/valuasi; menyamakan MA IHSG dengan MA emiten; menyebut death-cross IHSG sebagai death-cross emiten.
 Jelaskan WHY dari engine; jangan mengubah signal engine.
 Bahasa Indonesia, poin. Bukan saran investasi.""",
     "fundamental": """Analis fundamental IDX. Angka hanya canonical_valuation / engine.facts.
@@ -742,13 +1098,22 @@ fee/pajak, expected_rr (TP1+TP2).
 engine.signals.market_regime BEARISH = headwind konteks, bukan invalidasi SL.
 UNKNOWN market = netral (bukan negatif).
 Bahasa Indonesia, singkat. Bukan saran investasi.""",
-    "critic": """Devil's advocate. Kritik dari engine + JSON saja.
+    "critic": """Devil's advocate IDX. Kritik HANYA dari engine + screener_row + strategy_playbook.
 
-- Jangan sebut retest gagal jika retest_status = NO_RETEST atau VALID_RETEST
-- Jangan samakan regime IHSG dengan death-cross emiten
-- PBV_PREMIUM boleh dikritik sebagai premium, bukan otomatis overvalued
-- market_regime UNKNOWN ≠ red flag bearish
-- Sebut RR expected vs hanya TP1 jika relevan
+ATURAN UMUM (semua strategy):
+- Kritik harus koheren dengan **screener_version** / strategy_playbook — jangan pakai kriteria strategy lain
+- Jangan sebut retest gagal jika retest_status = NO_RETEST / VALID_RETEST / UNKNOWN
+- Jangan samakan regime IHSG dengan rezim/death-cross emiten
+- CONFLICT alignment = risiko konteks, bukan otomatis invalidasi setup
+- PBV_PREMIUM ≠ OVERVALUED tanpa peer
+- market_regime UNKNOWN ≠ bearish
+- Fokus: invalidation setup, false signal, SL quality, RR tipis, data quality
+
+FORMAT:
+1) Premis strategy (1 kalimat dari strategy_playbook.thesis)
+2) 3–5 titik gagal spesifik strategy ini (bukan generic)
+3) Apa yang BUKAN red flag untuk strategy ini
+4) Verdict critic: WEAK / ACCEPTABLE_WITH_CAVEATS / STRONG_CAVEATS — selaras engine.stance
 
 Bahasa Indonesia, poin. Bukan saran investasi.""",
     "chief": """Head trader. AI MENJELASKAN hasil engine; JANGAN mengarang skor baru.
@@ -761,18 +1126,21 @@ SCORECARD (salin angka engine, mapping arah dari signals):
 
 ### SCORECARD BIAS — {TICKER}
 - Teknikal: {Bullish|Bearish|Netral} {engine.scores.technical_score}%
+- Rezim emiten: {engine.signals.ticker_regime} ({engine.signals.ticker_regime_strength})
 - Fundamental: {arah dari valuation/ROE} {engine.scores.fundamental_score}%
 - Pasar IHSG: {engine.signals.market_regime} {engine.scores.market_score}%
+- Alignment: {engine.signals.regime_alignment}
 - **Final (engine): {engine.scores.final_score}/100** · stance: {engine.stance}
 - Fundamental confidence: ...
 - Link Sectors berita + profil
 
 Lalu jelaskan:
 1) Breakdown singkat kenapa final_score terbentuk (weights di engine.scores)
-2) Tiga syarat sebelum entry
-3) Key positives / key risks (pisah emiten vs IHSG)
-4) Retest + Fibo state dari engine.signals (NO_RETEST bukan gagal)
-5) Kesimpulan selaras stance engine
+2) Rezim emiten vs IHSG (alignment) — jangan dicampur
+3) Tiga syarat sebelum entry
+4) Key positives / key risks (pisah emiten vs IHSG)
+5) Retest + Fibo state dari engine.signals (NO_RETEST bukan gagal)
+6) Kesimpulan selaras stance engine
 
 Bahasa Indonesia. Bukan financial advice.""",
 }
@@ -1973,6 +2341,7 @@ def build_context(
         "as_of": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "ticker": ticker,
         "screener_version": version,
+        "strategy_playbook": get_strategy_playbook(version),
         "screener_row": row_dict,
         "account": {
             "size_rp": account_size,
@@ -2015,6 +2384,8 @@ def build_context(
             "regime_is_ihsg_index_only": True,
             "regime_last_close_is_ihsg_index": True,
             "ticker_trend_source": "ma_structure + screener_row (bukan regime.reason)",
+            "ticker_regime_source": "engine.signals.ticker_regime (derive_ticker_regime)",
+            "ihsg_vs_ticker_must_stay_separate": True,
             "setup_truth_source": "screener_row (RetestOK, Alasan, Fibo, Score)",
             "do_not_merge_ihsg_ma_with_ticker_ma": True,
             "rejected_metrics": fund.get("rejected_metrics") or {},
@@ -2031,12 +2402,28 @@ def build_context(
     # Engine deterministik — berlaku semua strategy (v2–v5, intra, hb, acc)
     try:
         ctx["engine"] = run_analysis_engine(ctx)
+        # Ekspos rezim emiten di root context agar semua role mudah baca
+        eng = ctx["engine"]
+        sig = (eng or {}).get("signals") or {}
+        facts = (eng or {}).get("facts") or {}
+        ctx["ticker_regime"] = {
+            "regime": sig.get("ticker_regime") or facts.get("ticker_regime"),
+            "strength": sig.get("ticker_regime_strength") or facts.get("ticker_regime_strength"),
+            "summary": sig.get("ticker_regime_summary") or facts.get("ticker_regime_summary"),
+            "notes": sig.get("ticker_regime_notes") or facts.get("ticker_regime_notes") or [],
+            "alignment_with_ihsg": sig.get("regime_alignment"),
+            "alignment_note": sig.get("regime_alignment_note"),
+            "_note": (
+                "Rezim EMITEN (MA/ADX/ROC). Terpisah dari regime/market_regime = IHSG."
+            ),
+        }
     except Exception as e:
         ctx["engine"] = {
             "error": str(e),
             "stance": "INSUFFICIENT_DATA",
             "instructions_for_llm": "Engine gagal; jangan mengarang skor.",
         }
+        ctx["ticker_regime"] = {"regime": "UNKNOWN", "error": str(e)}
     if include_news:
         try:
             ctx["news_intel"] = fetch_news_intel(ticker)
@@ -2348,13 +2735,19 @@ def _offline_fallback(role: str, context: dict) -> str:
             ]
         )
     if role == "critic":
-        return "\n".join(
-            [
-                f"[Offline] Critic — {ticker}",
-                "- Data screener bisa basi; fundamental Yahoo bisa tidak lengkap.",
-                "- Rezim tidak align / SL terlalu lebar = red flag.",
-            ]
+        pb = context.get("strategy_playbook") or get_strategy_playbook(
+            context.get("screener_version")
         )
+        inv = pb.get("invalidation") or []
+        lines = [
+            f"[Offline] Critic — {ticker} | {pb.get('name')}",
+            f"- Thesis: {pb.get('thesis')}",
+            f"- Fokus: {pb.get('critic_focus')}",
+        ]
+        for x in inv[:4]:
+            lines.append(f"- Invalidation: {x}")
+        lines.append("- Alignment CONFLICT / SL vs ATR / data quality tetap dicek.")
+        return "\n".join(lines)
     bias = "watch"
     try:
         if rr is not None and float(rr) >= 2 and score is not None and float(score) >= 70:
@@ -2378,10 +2771,19 @@ def run_role(role: str, context: dict, *, model: str | None = None) -> str:
         raise ValueError(f"Role tidak dikenal: {role}")
     if not llm_available():
         return _offline_fallback(role, context)
+    # Pastikan playbook strategy ada di context (critic/chief)
+    ver = context.get("screener_version") or context.get("version")
+    if "strategy_playbook" not in context:
+        context = {**context, "strategy_playbook": get_strategy_playbook(ver)}
     user_payload = json.dumps(context, ensure_ascii=False, indent=2)
     max_tokens = ROLE_MAX_TOKENS.get(role, 900)
+    system = (
+        build_critic_system_prompt(ver)
+        if role == "critic"
+        else SYSTEM_PROMPTS[role]
+    )
     return _chat(
-        SYSTEM_PROMPTS[role],
+        system,
         user_payload,
         model=model,
         max_tokens=max_tokens,
@@ -2688,10 +3090,22 @@ def save_analysis_to_txt(
                 if fund.get(k) is not None:
                     lines.append(f"  {k}: {fund.get(k)}")
             lines.append("")
-        regime = ctx.get("regime") or {}
+        tr = ctx.get("ticker_regime") or {}
+        if tr:
+            lines.append("[Rezim Emiten]")
+            for k in ("regime", "strength", "summary", "alignment_with_ihsg", "alignment_note"):
+                if tr.get(k) is not None:
+                    lines.append(f"  {k}: {tr.get(k)}")
+            notes = tr.get("notes") or []
+            if notes:
+                lines.append(f"  notes: {'; '.join(str(n) for n in notes[:6])}")
+            lines.append("")
+        regime = ctx.get("regime") or ctx.get("market_regime") or {}
         if regime:
-            lines.append("[Regime]")
+            lines.append("[Regime IHSG]")
             for k, v in list(regime.items())[:12]:
+                if str(k).startswith("_"):
+                    continue
                 lines.append(f"  {k}: {v}")
             lines.append("")
 
