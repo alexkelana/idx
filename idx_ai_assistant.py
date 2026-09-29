@@ -16,7 +16,8 @@ Provider: OpenAI-compatible API (urllib; bypass httpx bila bermasalah)
     OPENAI_BASE_URL  (default https://api.openai.com/v1)
     OPENAI_MODEL     (default gpt-4o-mini)
     OPENAI_TIMEOUT   (default 180)
-    OPENAI_MAX_RETRIES (default 2)
+    OPENAI_MAX_RETRIES (default 5)
+    OPENAI_ROLE_GAP_SEC (default 2.5, jeda antar role)
 """
 
 from __future__ import annotations
@@ -113,12 +114,16 @@ DEFAULT_BASE_URL = _default_base_url()
 ROLE_ORDER = ["technical", "fundamental", "risk", "critic", "chief"]
 
 ROLE_MAX_TOKENS = {
-    "technical": 1000,
-    "fundamental": 1000,
-    "risk": 900,
-    "critic": 1100,
-    "chief": 1600,
+    "technical": 700,
+    "fundamental": 650,
+    "risk": 550,
+    "critic": 750,
+    "chief": 1000,
 }
+
+# Jeda antar role (detik) — bantu TPM limit tier rendah (30k TPM)
+ROLE_GAP_SEC = float(os.environ.get("OPENAI_ROLE_GAP_SEC", "2.5"))
+
 
 # =========================================================================
 # DETERMINISTIC ANALYSIS ENGINE (FACT → SIGNAL → SCORE → STANCE)
@@ -2577,6 +2582,126 @@ def _build_chat_body(
     return body
 
 
+
+def _parse_retry_after_seconds(err_body: str, default: float = 3.0) -> float:
+    """Ambil 'Please try again in X.Ys' dari body 429 OpenAI."""
+    import re
+    if not err_body:
+        return default
+    m = re.search(r"try again in\s+([0-9.]+)\s*s", err_body, re.I)
+    if m:
+        try:
+            return max(1.0, float(m.group(1)) + 0.5)
+        except Exception:
+            pass
+    m2 = re.search(r"retry.after[\"']?\s*[:=]\s*[\"']?([0-9.]+)", err_body, re.I)
+    if m2:
+        try:
+            return max(1.0, float(m2.group(1)))
+        except Exception:
+            pass
+    return default
+
+
+def _compact_context_for_role(role: str, context: dict) -> dict:
+    """
+    Kurangi payload JSON ke LLM (hemat TPM).
+    Full context sering >6–8k token; compact ~1.5–3k.
+    """
+    eng = context.get("engine") or {}
+    facts = eng.get("facts") or {}
+    signals = eng.get("signals") or {}
+    scores = eng.get("scores") or {}
+    row = context.get("screener_row") or {}
+    # Field screener penting saja
+    row_keys = (
+        "Ticker", "Close", "Entry", "EntryBreakout", "StopLoss",
+        "Target1", "Target", "Target(Peak)", "Target(Liquidity)", "Target2",
+        "RR_Ratio", "Score", "Alasan", "RetestOK", "Sweep", "SweepLow",
+        "CHOCH_Level", "CHOCH_Age", "Fibo_50", "Fibo_618", "Fibo_786",
+        "OB_TOP", "OB_BOTTOM", "ATR", "ADX", "ROC(10)", "DaysSinceBO",
+        "Lots", "Strategy", "SetupType",
+    )
+    slim_row = {k: row[k] for k in row_keys if k in row and row[k] is not None}
+
+    fund = context.get("fundamental") or {}
+    fund_keys = (
+        "source", "confidence", "pe_ratio", "pb_ratio", "roe", "eps",
+        "dividend_yield_pct", "market_cap", "sector", "valuation_note",
+        "sectors_company_url", "sectors_news_url",
+    )
+    slim_fund = {k: fund[k] for k in fund_keys if k in fund and fund[k] is not None}
+
+    ma = context.get("ma_structure") or {}
+    slim_ma = {
+        "available": ma.get("available"),
+        "ma": ma.get("ma"),
+        "stack": ma.get("stack"),
+        "crosses": ma.get("crosses"),
+        "interpretation_hints": (ma.get("interpretation_hints") or [])[:6],
+    }
+
+    news = context.get("news_intel") or {}
+    heads = news.get("headlines") or []
+    slim_news = {
+        "tone_hint": news.get("tone_hint"),
+        "headline_count": news.get("headline_count"),
+        "headlines": [
+            {"title": (h.get("title") or "")[:120], "source": h.get("source")}
+            for h in heads[:4]
+            if isinstance(h, dict)
+        ],
+        "sectors_news_url": news.get("sectors_news_url"),
+    }
+
+    base = {
+        "ticker": context.get("ticker"),
+        "screener_version": context.get("screener_version"),
+        "strategy_playbook": context.get("strategy_playbook"),
+        "data_contract": context.get("data_contract"),
+        "screener_row": slim_row,
+        "engine": {
+            "facts": facts,
+            "signals": signals,
+            "scores": scores,
+            "stance": eng.get("stance"),
+            "scorecard_text": eng.get("scorecard_text"),
+            "instructions_for_llm": eng.get("instructions_for_llm"),
+        },
+        "ticker_regime": context.get("ticker_regime"),
+        "market_regime": context.get("market_regime") or context.get("regime"),
+        "account": context.get("account"),
+        "fees": context.get("fees"),
+        "disclaimer": context.get("disclaimer"),
+    }
+
+    if role in ("fundamental", "chief", "critic"):
+        base["fundamental"] = slim_fund
+        base["canonical_valuation"] = context.get("canonical_valuation") or {
+            k: slim_fund.get(k) for k in ("pe_ratio", "pb_ratio", "roe")
+        }
+        base["news_intel"] = slim_news
+    if role in ("technical", "chief", "critic", "risk"):
+        base["ma_structure"] = slim_ma
+    if role == "chief":
+        # analyses diisi di run_agents
+        if "analyses" in context:
+            # potong panjang per role
+            an = {}
+            for k, v in (context.get("analyses") or {}).items():
+                s = str(v or "")
+                an[k] = s if len(s) <= 1800 else s[:1800] + "\n…[truncated]"
+            base["analyses"] = an
+        base["engine_scorecard_locked"] = context.get("engine_scorecard_locked") or eng.get(
+            "scorecard_text"
+        )
+    if role == "risk":
+        base["fundamental"] = {
+            k: slim_fund.get(k) for k in ("source", "confidence", "market_cap")
+        }
+    return base
+
+
 def _chat(
     system: str,
     user: str,
@@ -2595,7 +2720,8 @@ def _chat(
     model = model or _default_model()
     base_url = (base_url or _default_base_url()).rstrip("/")
     timeout_sec = float(os.environ.get("OPENAI_TIMEOUT", "180"))
-    max_retries = int(os.environ.get("OPENAI_MAX_RETRIES", "2"))
+    # Default lebih longgar untuk 429 TPM (tier rendah sering 30k TPM)
+    max_retries = int(os.environ.get("OPENAI_MAX_RETRIES", "5"))
 
     import urllib.request
     import urllib.error
@@ -2670,14 +2796,21 @@ def _chat(
                 if attempt < attempts:
                     continue
 
-            if he.code in (429, 500, 502, 503, 504) and attempt < attempts:
-                time.sleep(min(2 ** attempt, 8))
+            if he.code == 429 and attempt < attempts:
+                wait = _parse_retry_after_seconds(err_body, default=float(2 ** attempt))
+                wait = min(max(wait, 1.5), 60.0)
+                time.sleep(wait)
+                continue
+            if he.code in (500, 502, 503, 504) and attempt < attempts:
+                time.sleep(min(2 ** attempt, 12))
                 continue
             raise last_err from he
         except Exception as e:
             last_err = e
             if attempt < attempts and _is_retryable_error(e):
-                time.sleep(min(2 ** attempt, 8))
+                msg = str(e)
+                wait = _parse_retry_after_seconds(msg, default=float(2 ** attempt))
+                time.sleep(min(max(wait, 1.5), 60.0))
                 continue
             raise RuntimeError(_format_llm_error(e)) from e
 
@@ -2775,8 +2908,9 @@ def run_role(role: str, context: dict, *, model: str | None = None) -> str:
     ver = context.get("screener_version") or context.get("version")
     if "strategy_playbook" not in context:
         context = {**context, "strategy_playbook": get_strategy_playbook(ver)}
-    user_payload = json.dumps(context, ensure_ascii=False, indent=2)
-    max_tokens = ROLE_MAX_TOKENS.get(role, 900)
+    compact = _compact_context_for_role(role, context)
+    user_payload = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    max_tokens = ROLE_MAX_TOKENS.get(role, 700)
     system = (
         build_critic_system_prompt(ver)
         if role == "critic"
@@ -2851,12 +2985,18 @@ def run_agents(
     analyses: dict[str, str] = {}
     errors: dict[str, str] = {}
 
-    for role in [r for r in roles if r != "chief"]:
+    non_chief = [r for r in roles if r != "chief"]
+    for i, role in enumerate(non_chief):
+        if i > 0 and not offline:
+            time.sleep(ROLE_GAP_SEC)
         try:
             analyses[role] = run_role(role, context, model=model)
         except Exception as e:
             errors[role] = _format_llm_error(e)
             analyses[role] = f"[Gagal] {errors[role]}"
+            # cooldown ekstra setelah 429
+            if "429" in str(e) or "rate_limit" in str(e).lower():
+                time.sleep(max(ROLE_GAP_SEC, 5.0))
 
     if "chief" in roles:
         ok = {k: v for k, v in analyses.items() if not str(v).startswith("[Gagal]")}
@@ -2870,6 +3010,8 @@ def run_agents(
             errors["chief"] = analyses["chief"]
         else:
             try:
+                if not offline:
+                    time.sleep(ROLE_GAP_SEC)
                 analyses["chief"] = run_role(
                     "chief",
                     {
