@@ -595,6 +595,18 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
 
     score = int(max(0, min(score, 100)))
 
+    # MA50/200 cross modifier (trend profile) — sebelum filter min_score
+    mx = {
+        "delta": 0, "signal": "NONE", "age": None, "note": "",
+        "ma50": None, "ma200": None, "spread_pct": None, "structural": "FLAT",
+    }
+    try:
+        from idx_ma_cross_screener import apply_ma_cross_score
+        score, mx = apply_ma_cross_score(score, df, profile="trend", reasons=reasons)
+        score = int(max(0, min(score, 100)))
+    except Exception:
+        pass
+
     if score < int(params.get("min_score", 40)):
         return None
 
@@ -674,6 +686,11 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         "Score": score,
         "Quality": q,
         "Alasan": "; ".join(reasons),
+        "MA_Cross": mx.get("signal"),
+        "MA_CrossAge": mx.get("age"),
+        "MA_CrossDelta": mx.get("delta"),
+        "MA200": mx.get("ma200"),
+        "MA_SpreadPct": mx.get("spread_pct"),
         "Entry": entry,
         "StopLoss": stop_loss,
         "SL_Source": sl_source,

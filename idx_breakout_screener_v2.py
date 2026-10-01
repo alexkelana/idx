@@ -698,6 +698,17 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         params=params,
     )
 
+    # MA50/200 cross → penambah/pengurang skor (profil trend)
+    mx = {
+        "delta": 0, "signal": "NONE", "age": None, "note": "",
+        "ma50": None, "ma200": None, "spread_pct": None, "structural": "FLAT",
+    }
+    try:
+        from idx_ma_cross_screener import apply_ma_cross_score
+        score, mx = apply_ma_cross_score(score, df, profile="trend", reasons=reasons)
+    except Exception:
+        pass
+
     result = {
         "Ticker": sym,
         "SetupType": setup_type,
@@ -712,6 +723,11 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         "Squeeze": is_squeeze,
         "Score": score,
         "Alasan": "; ".join(reasons) if reasons else "-",
+        "MA_Cross": mx.get("signal"),
+        "MA_CrossAge": mx.get("age"),
+        "MA_CrossDelta": mx.get("delta"),
+        "MA200": mx.get("ma200"),
+        "MA_SpreadPct": mx.get("spread_pct"),
         "Sweep": "Ya" if sweep["has_sweep"] else "Tidak",
         "SweepHigh": round_to_idx_tick(sweep.get("sweep_high", 0)),
         "SweepWickPct": sweep.get("wick_pct", 0),

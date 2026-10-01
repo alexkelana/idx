@@ -225,7 +225,33 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
     est_profit = actual_shares * (target_1 - entry)
 
     risk_atr = round(risk_per_share / atr, 2) if atr > 0 else 0.0
-    risk_pct = round(risk_per_share / entry * 100, 2) if entry > 0 else 0.0
+    risk_pct_out = round(risk_per_share / entry * 100, 2) if entry > 0 else 0.0
+
+    # Base score V4 (tidak ada skor sebelumnya) + MA cross trend profile
+    score = 50
+    reasons = ["OB mitigasi + BOS"]
+    if rr_ratio >= 2.5:
+        score += 15
+        reasons.append(f"RR kuat ({rr_ratio:.1f})")
+    elif rr_ratio >= 1.8:
+        score += 8
+        reasons.append(f"RR OK ({rr_ratio:.1f})")
+    if dist_to_ob_pct <= 1.0:
+        score += 10
+        reasons.append("Sangat dekat OB")
+    elif dist_to_ob_pct <= 2.0:
+        score += 5
+        reasons.append("Dekat OB")
+    mx = {
+        "delta": 0, "signal": "NONE", "age": None, "note": "",
+        "ma50": None, "ma200": None, "spread_pct": None, "structural": "FLAT",
+    }
+    try:
+        from idx_ma_cross_screener import apply_ma_cross_score
+        score, mx = apply_ma_cross_score(score, df, profile="trend", reasons=reasons)
+    except Exception:
+        pass
+    score = int(max(0, min(100, score)))
 
     return {
         "Ticker": symbol,
@@ -237,12 +263,20 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
         "SL_Source": sl_source,
         "Target(Liquidity)": target_1,
         "RR_Ratio": round(rr_ratio, 2),
+        "Score": score,
+        "Alasan": "; ".join(reasons),
+        "MA_Cross": mx.get("signal"),
+        "MA_CrossAge": mx.get("age"),
+        "MA_CrossDelta": mx.get("delta"),
+        "MA200": mx.get("ma200"),
+        "MA_SpreadPct": mx.get("spread_pct"),
         "ATR": round(atr, 1),
         "RiskATR": risk_atr,
-        "RiskPct": risk_pct,
+        "RiskPct": risk_pct_out,
         "Lots": lots,
         "EstLoss(Rp)": round(est_loss, 0),
         "EstProfit(Rp)": round(est_profit, 0),
+        "Strategy": "V4 (SMC OB)",
     }
 
 def run_screener_v4(user_params: dict = None, universe=None):

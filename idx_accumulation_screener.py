@@ -345,11 +345,26 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     shares = lots * params["lot_size"]
     dist_break = (acc["range_high"] - last) / last * 100.0
 
+    mx = {"delta": 0, "signal": "NONE", "age": None, "ma200": None, "spread_pct": None}
+    try:
+        from idx_ma_cross_screener import apply_ma_cross_score
+        reasons = []
+        score, mx = apply_ma_cross_score(score, df, profile="soft", reasons=reasons)
+        # append notes to existing Alasan field later if present
+        _ma_note = mx.get("note") or ""
+    except Exception:
+        _ma_note = ""
+
     return {
         "Ticker": symbol,
         "Close": entry,
         "Phase": phase,
         "Score": score,
+        "MA_Cross": mx.get("signal"),
+        "MA_CrossAge": mx.get("age"),
+        "MA_CrossDelta": mx.get("delta"),
+        "MA200": mx.get("ma200"),
+        "MA_SpreadPct": mx.get("spread_pct"),
         "RangeLow": round_to_idx_tick(acc["range_low"]),
         "RangeHigh": round_to_idx_tick(acc["range_high"]),
         "Range%": round(acc["range_pct"], 1),

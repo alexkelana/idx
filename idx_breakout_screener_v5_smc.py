@@ -284,6 +284,17 @@ def analyze_smc_v5_ticker(symbol: str, user_params: dict = None) -> dict | None:
             f"{sweep.get('wick_pct', 0)}%, {sweep.get('bars_ago', '?')} bar lalu)"
         )
 
+    # MA50/200 modifier — profil soft (mean-reversion CHOCH)
+    mx = {
+        "delta": 0, "signal": "NONE", "age": None, "note": "",
+        "ma50": None, "ma200": None, "spread_pct": None, "structural": "FLAT",
+    }
+    try:
+        from idx_ma_cross_screener import apply_ma_cross_score
+        score, mx = apply_ma_cross_score(score, df, profile="soft", reasons=reasons)
+    except Exception:
+        pass
+
     risk_rp = account_size * (risk_pct / 100.0)
     shares = int(risk_rp / risk_per_share) if risk_per_share > 0 else 0
     lots = shares // 100
@@ -302,6 +313,11 @@ def analyze_smc_v5_ticker(symbol: str, user_params: dict = None) -> dict | None:
         "Target(Peak)": target_1,
         "RR_Ratio": round(rr_ratio, 2),
         "Score": score,
+        "MA_Cross": mx.get("signal"),
+        "MA_CrossAge": mx.get("age"),
+        "MA_CrossDelta": mx.get("delta"),
+        "MA200": mx.get("ma200"),
+        "MA_SpreadPct": mx.get("spread_pct"),
         "SweepLow": "Ya" if sweep["has_sweep"] else "Tidak",
         "SweepLowPrice": round_to_idx_tick(sweep.get("sweep_low", 0)),
         "SweepWickPct": sweep.get("wick_pct", 0),

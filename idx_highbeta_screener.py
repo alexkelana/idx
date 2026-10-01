@@ -273,10 +273,22 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     lots = int((risk_rp / risk) // params["lot_size"]) if risk > 0 else 0
     shares = lots * params["lot_size"]
 
+    mx = {"delta": 0, "signal": "NONE", "age": None, "ma200": None, "spread_pct": None}
+    try:
+        from idx_ma_cross_screener import apply_ma_cross_score
+        score, mx = apply_ma_cross_score(score, df, profile="light", reasons=None)
+    except Exception:
+        pass
+
     return {
         "Ticker": symbol,
         "Close": entry,
         "Score": score,
+        "MA_Cross": mx.get("signal"),
+        "MA_CrossAge": mx.get("age"),
+        "MA_CrossDelta": mx.get("delta"),
+        "MA200": mx.get("ma200"),
+        "MA_SpreadPct": mx.get("spread_pct"),
         "AvgValue20D(M)": round(avg_val / 1e9, 1),
         "Range20%": round(range20, 1),
         "ATR%": round(atr_pct, 2),
