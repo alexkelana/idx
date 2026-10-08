@@ -1,4 +1,21 @@
 """
+IDX BREAKOUT SCREENER + POSITION PLAN — v2 (engine-enriched)
+============================================================
+Filter false breakout:
+  1) Liquidity sweep di resistance sebelumnya
+  2) Momentum masih mendukung real breakout
+
+Enrichment dari Trading Engine:
+  - SL: gabungan struktur + buffer ATR (min jarak)
+  - Volume ratio harian vs MA20
+  - Setup BREAKOUT | RETEST
+  - Skor ranking (sweep, volume, trend, RR)
+  - Lots + net PnL setelah fee beli/jual
+  - Entry struktural hybrid (idx_entry_struct)
+"""
+
+from __future__ import annotations
+
 # --- Exchange rules (tick + ARA/ARB BEI Sep 2026) ---
 try:
     from idx_exchange_rules import (
@@ -9,7 +26,6 @@ try:
         describe_rules,
     )
 except ImportError:
-    # Fallback minimal jika modul belum ter-deploy
     def round_to_idx_tick(price: float) -> int:
         if price is None or price <= 0:
             return 0
@@ -59,21 +75,7 @@ except ImportError:
     def describe_rules(asof=None):
         return "fallback local ARA/ARB"
 
-IDX BREAKOUT SCREENER + POSITION PLAN — v2 (engine-enriched)
-============================================================
-Filter false breakout:
-  1) Liquidity sweep di resistance sebelumnya
-  2) Momentum masih mendukung real breakout
 
-Enrichment dari Trading Engine:
-  - SL: gabungan struktur + buffer ATR (min jarak)
-  - Volume ratio harian vs MA20
-  - Setup BREAKOUT | RETEST
-  - Skor ranking (sweep, volume, trend, RR)
-  - Lots + net PnL setelah fee beli/jual
-"""
-
-from __future__ import annotations
 
 from datetime import datetime
 
@@ -105,6 +107,14 @@ PARAMS = {
     "min_score": 40,
     "entry_buffer_pct": 0.5,
     "stop_buffer_pct": 0.5,
+    # Entry struktural hybrid (High bear pra-break)
+    "use_structural_entry": True,
+    "struct_lookback": 40,
+    "bear_lookback_extra": 15,
+    "market_max_dist_atr": 0.75,
+    "market_max_dist_pct": 1.2,
+    "limit_expiry_bars": 5,
+    "min_bear_body_pct": 0.15,
     "atr_stop_mult": 1.5,  # jarak SL minimal ~ ATR * mult dari entry
     "atr_sl_buffer": 0.50,  # buffer di bawah level struktur (× ATR)
     "min_risk_reward": 1.5,
@@ -408,6 +418,7 @@ def build_position_plan(
     recent_high,
     recent_low,
     params,
+    df=None,
 ):
     res_candidates = [h for h in swing_highs if h > last_close] or [recent_high]
     resistance = min(res_candidates) if res_candidates else recent_high
@@ -468,11 +479,12 @@ def build_position_plan(
     net_tp1 = trade_net_pnl(entry, target_1, shares, params)
     net_tp2 = trade_net_pnl(entry, target_2, shares, params)
 
-    return {
+    plan = {
         "Support": round_to_idx_tick(support),
         "Resistance": round_to_idx_tick(resistance),
         "Resistance2": round_to_idx_tick(resistance_2),
         "EntryBreakout": entry,
+        "Entry": entry,
         "EntryRetest": retest_entry,
         "StopLoss": stop_loss,
         "Target1": target_1,
@@ -491,7 +503,43 @@ def build_position_plan(
         "NetPnL_TP1": net_tp1,
         "NetPnL_TP2": net_tp2,
         "Confluence": "; ".join(confluence_notes) if confluence_notes else "-",
+        "EntryClose": entry,
+        "EntryStruct": None,
+        "EntryMode": "FALLBACK",
+        "EntryStructNote": "-",
+        "EntryExpiryBars": int(params.get("limit_expiry_bars", 5)),
+        "DistEntryStructPct": None,
     }
+
+    # Hybrid structural entry: High bear pra-break
+    if params.get("use_structural_entry", True) and df is not None:
+        try:
+            from idx_entry_struct import apply_structural_entry_to_plan
+
+            atr_v = float(atr) if atr is not None and not (isinstance(atr, float) and np.isnan(atr)) else 0.0
+            plan = apply_structural_entry_to_plan(
+                plan,
+                df,
+                resistance=float(resistance),
+                last_close=float(last_close),
+                atr=atr_v,
+                params=params,
+            )
+            # Sync net PnL ke entry final
+            entry_f = float(plan.get("Entry") or entry)
+            shares_f = int(plan.get("SuggestedShares") or shares)
+            plan["NetPnL_SL"] = trade_net_pnl(entry_f, stop_loss, shares_f, params)
+            plan["NetPnL_TP1"] = trade_net_pnl(entry_f, target_1, shares_f, params)
+            plan["NetPnL_TP2"] = trade_net_pnl(entry_f, target_2, shares_f, params)
+            plan["LayakRR"] = float(plan.get("RR_Ratio") or 0) >= params["min_risk_reward"]
+            if plan.get("EntryMode") == "LIMIT":
+                note = plan.get("EntryStructNote") or "LIMIT struktural"
+                conf = plan.get("Confluence") or "-"
+                plan["Confluence"] = (conf + "; " if conf != "-" else "") + note
+        except Exception:
+            pass
+
+    return plan
 
 
 def compute_setup_score(
@@ -648,7 +696,7 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         return None
 
     plan = build_position_plan(
-        last_close, swing_highs, swing_lows, atr, recent_high, recent_low, params
+        last_close, swing_highs, swing_lows, atr, recent_high, recent_low, params, df=df
     )
     if plan is None:
         return None
@@ -661,7 +709,7 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         lookback=params.get("sweep_lookback", 12),
         min_wick_pct=params.get("sweep_min_wick_pct", 0.25),
     )
-    if params.get("require_liquidity_sweep", True) and not sweep["has_sweep"]:
+    if params.get("require_liquidity_sweep", False) and not sweep["has_sweep"]:
         return None
 
     mom_ok, mom_notes = breakout_momentum_ok(
@@ -758,7 +806,11 @@ def run_screener(universe=None, params=None):
             row = analyze_ticker(sym, params)
             if row is not None:
                 results.append(row)
-        except Exception:
+        except Exception as e:
+            # Jangan diam total — bantu debug NameError/import
+            if "round_to_idx_tick" in str(e) or "apply_ara_arb" in str(e):
+                print(f"\n  [FATAL] {sym}: {e}")
+                raise
             continue
 
     print(" " * 60, end="\r")

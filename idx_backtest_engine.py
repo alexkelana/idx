@@ -296,6 +296,23 @@ def normalize_setup(row: dict | pd.Series, report_date: str | None = None) -> di
     if signal_date is not None:
         signal_date = str(signal_date).strip()[:10]
         signal_date = signal_date.replace("/", "-")
+    entry_mode_setup = str(
+        _row_get(row, "EntryMode", "entry_mode", "entry_mode_setup", default="FALLBACK")
+        or "FALLBACK"
+    ).upper().strip()
+    entry_struct = _f(_row_get(row, "EntryStruct", "entry_struct"))
+    entry_close = _f(_row_get(row, "EntryClose", "entry_close", "Close"))
+    try:
+        entry_expiry_bars = int(
+            _row_get(row, "EntryExpiryBars", "entry_expiry_bars", default=5) or 5
+        )
+    except Exception:
+        entry_expiry_bars = 5
+    # Jika LIMIT dan EntryStruct valid, entry plan = struct (jangan chase close)
+    if entry_mode_setup == "LIMIT" and entry_struct and entry_struct > 0:
+        if entry is None or abs(float(entry) - float(entry_struct)) > 0.01:
+            entry = float(entry_struct)
+
     return {
         "ticker": ticker,
         "entry": entry,
@@ -306,6 +323,10 @@ def normalize_setup(row: dict | pd.Series, report_date: str | None = None) -> di
         "strategy": strategy,
         "planned_rr": planned_rr,
         "signal_date": signal_date,
+        "entry_mode_setup": entry_mode_setup,
+        "entry_struct": entry_struct,
+        "entry_close": entry_close,
+        "entry_expiry_bars": entry_expiry_bars,
         "raw": row,
     }
 
@@ -413,14 +434,59 @@ def simulate_trade(
         # tanpa tanggal → anggap sinyal di bar terakhir
         sig_loc = len(ohlcv) - 1
 
-    # Entry bar
+    # Entry bar — hormati EntryMode struktural (LIMIT / MARKET / FALLBACK)
     mode = p.get("entry_mode", "next_open")
-    if mode == "signal_close":
+    setup_mode = str(setup.get("entry_mode_setup") or "FALLBACK").upper()
+    respect = bool(p.get("respect_structural_entry", True))
+    limit_expiry = int(
+        setup.get("entry_expiry_bars")
+        or p.get("default_limit_expiry_bars", 5)
+        or 5
+    )
+    fill_note = setup_mode
+
+    if respect and setup_mode == "LIMIT":
+        # Cari fill limit: Low menyentuh entry_plan dalam expiry bars
+        limit_px = float(entry_plan)
+        start_loc = sig_loc  # boleh fill di bar sinyal jika low sentuh
+        end_fill = min(len(ohlcv) - 1, start_loc + limit_expiry)
+        filled = False
+        entry_loc = start_loc
+        entry_price = limit_px
+        for i in range(start_loc, end_fill + 1):
+            lo = float(ohlcv["Low"].iloc[i])
+            op = float(ohlcv["Open"].iloc[i])
+            if lo <= limit_px:
+                # gap-through: open di bawah limit → fill open; else fill limit
+                entry_price = op if op <= limit_px else limit_px
+                entry_loc = i
+                filled = True
+                mode = "limit_touch"
+                fill_note = f"LIMIT fill @{entry_price:.0f} bar+{i - sig_loc}"
+                break
+        if not filled:
+            # Limit expired — tidak ada trade (realistis)
+            return None
+        # Pastikan entry masih di atas SL
+        if entry_price <= float(sl):
+            return None
+    elif respect and setup_mode == "MARKET":
+        # MARKET: next open (atau signal close), harga rencana ≈ close
+        entry_loc = sig_loc + 1
+        if entry_loc >= len(ohlcv):
+            entry_loc = sig_loc
+            entry_price = float(ohlcv["Close"].iloc[entry_loc])
+            mode = "market_signal_close"
+        else:
+            entry_price = float(ohlcv["Open"].iloc[entry_loc])
+            mode = "market_next_open"
+        fill_note = f"MARKET {mode}"
+    elif mode == "signal_close":
         entry_loc = sig_loc
         entry_price = float(ohlcv["Close"].iloc[entry_loc])
+        fill_note = "signal_close"
     else:
-        # next_open; jika belum ada bar berikutnya (sinyal hari terakhir),
-        # fallback ke close bar sinyal agar tetap bisa disimulasikan
+        # next_open default / FALLBACK
         entry_loc = sig_loc + 1
         if entry_loc >= len(ohlcv):
             entry_loc = sig_loc
@@ -428,6 +494,7 @@ def simulate_trade(
             mode = "signal_close_fallback"
         else:
             entry_price = float(ohlcv["Open"].iloc[entry_loc])
+        fill_note = f"FALLBACK {mode}"
 
     # Optional: gunakan planned entry dari screener jika dekat open/close
     # (default: harga bar aktual agar realistis)
@@ -525,7 +592,10 @@ def simulate_trade(
         lots=lots,
         planned_rr=_f(setup.get("planned_rr")),
         risk_per_share=round(risk_ps, 2),
-        notes=f"entry_mode={p['entry_mode']}; priority={p['intrabar_priority']}",
+        notes=(
+            f"entry_mode={mode}; setup={setup_mode}; fill={fill_note}; "
+            f"priority={p['intrabar_priority']}"
+        ),
     )
 
 

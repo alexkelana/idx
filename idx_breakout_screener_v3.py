@@ -48,6 +48,14 @@ PARAMS = {
     "require_retest_touch": False,
     "retest_wick_min_pct": 0.15,
     "min_score": 40,
+    # Entry struktural hybrid (High bear pra-BO / level BO)
+    "use_structural_entry": True,
+    "market_max_dist_pct": 1.2,
+    "market_max_dist_atr": 0.75,
+    "limit_expiry_bars": 5,
+    "min_bear_body_pct": 0.15,
+    "struct_lookback": 40,
+    "bear_lookback_extra": 15,
     # Scoring freshness / trend strength
     "score_bo_fresh_max_days": 5,
     "score_bo_stale_days": 10,
@@ -610,7 +618,76 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
     if score < int(params.get("min_score", 40)):
         return None
 
-    entry = round_to_idx_tick(last_close)
+    # --- Entry struktural hybrid (V3 retest) ---
+    # Level yang dibreak = breakout_price; EntryStruct = High bear pra-BO
+    # diklem ke zona fibo agar tidak bentrok thesis pullback.
+    entry_close = float(round_to_idx_tick(last_close))
+    entry_struct = float(round_to_idx_tick(breakout_price))
+    entry_mode = "FALLBACK"
+    entry_note = "Fallback @ close"
+    dist_struct_pct = 0.0
+    limit_expiry_bars = int(params.get("limit_expiry_bars", 5))
+
+    if params.get("use_structural_entry", True):
+        try:
+            from idx_entry_struct import compute_structural_entry
+
+            se = compute_structural_entry(
+                df,
+                resistance=float(breakout_price),
+                last_close=float(last_close),
+                atr=float(atr or 0),
+                default_entry=entry_close,
+                params=params,
+            )
+            if se.get("entry_struct"):
+                entry_struct = float(se["entry_struct"])
+            # Klem ke zona fibo + support BO (jangan limit di luar thesis retest)
+            floor = max(float(fib_618), float(breakout_price) * 0.995)
+            ceiling = float(fib_236)
+            entry_struct = max(entry_struct, floor)
+            entry_struct = min(entry_struct, ceiling)
+            entry_struct = float(round_to_idx_tick(entry_struct))
+
+            dist_struct_pct = (
+                abs(entry_close - entry_struct) / entry_close * 100 if entry_close else 0.0
+            )
+            dist_atr = (
+                abs(entry_close - entry_struct) / atr if atr and atr > 0 else 999.0
+            )
+            near = dist_struct_pct <= float(
+                params.get("market_max_dist_pct", 1.2)
+            ) or dist_atr <= float(params.get("market_max_dist_atr", 0.75))
+            # Dekat fib 38.2 ideal → market
+            near_fibo382 = abs(entry_close - float(fib_382)) / entry_close * 100 <= 1.5
+
+            if near or near_fibo382:
+                entry = entry_close
+                entry_mode = "MARKET"
+                entry_note = (
+                    f"MARKET @ close (dekat struktur/fibo382; "
+                    f"EntryStruct {entry_struct}, Δ{dist_struct_pct:.1f}%)"
+                )
+            else:
+                entry = entry_struct
+                entry_mode = "LIMIT"
+                entry_note = (
+                    f"LIMIT @ EntryStruct {entry_struct} "
+                    f"(bear pra-BO / zona retest); expiry {limit_expiry_bars} bar; "
+                    f"close {entry_close:.0f} Δ{dist_struct_pct:.1f}%"
+                )
+            reasons.append(entry_note)
+            if entry_mode == "LIMIT":
+                score = int(min(100, score + 2))
+        except Exception as e:
+            entry = entry_close
+            entry_mode = "FALLBACK"
+            entry_note = f"Struct entry error → close ({e})"
+            entry_struct = float(round_to_idx_tick(breakout_price))
+    else:
+        entry = entry_close
+
+    entry = float(round_to_idx_tick(entry))
     stop_loss, sl_source, risk_atr, risk_pct = compute_hybrid_stop(
         entry, breakout_price, swing_low, atr, last_close, params
     )
@@ -692,6 +769,12 @@ def analyze_ticker(symbol: str, params: dict) -> dict | None:
         "MA200": mx.get("ma200"),
         "MA_SpreadPct": mx.get("spread_pct"),
         "Entry": entry,
+        "EntryClose": entry_close,
+        "EntryStruct": entry_struct,
+        "EntryMode": entry_mode,
+        "EntryStructNote": entry_note,
+        "EntryExpiryBars": limit_expiry_bars,
+        "DistEntryStructPct": round(dist_struct_pct, 2),
         "StopLoss": stop_loss,
         "SL_Source": sl_source,
         "Target1": target_1,

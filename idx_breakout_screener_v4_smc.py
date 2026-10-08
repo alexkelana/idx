@@ -151,10 +151,7 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
     if dist_to_ob_pct > 3.0 or not has_mitigated:
         return None
 
-    # Trading Plan
-    entry = round_to_idx_tick(last_close)
-
-    # ATR(14) untuk lantai risk — cegah RR fantasi dari SL menempel OB
+    # ATR dulu (untuk hybrid entry + SL)
     high_s = df["High"]
     low_s = df["Low"]
     close_s = df["Close"]
@@ -169,7 +166,43 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
     ).max(axis=1)
     atr = float(tr.tail(14).mean()) if len(tr) >= 14 else float(tr.mean())
     if not atr or atr != atr or atr <= 0:
-        atr = entry * 0.02
+        atr = float(last_close) * 0.02
+
+    # --- Entry struktural hybrid (V4) ---
+    # Di SMC V4, Order Block = candle bear pra-BOS → EntryStruct = OB_Top
+    entry_close = float(round_to_idx_tick(last_close))
+    entry_struct = float(round_to_idx_tick(ob_top))
+    market_max_dist_pct = float((user_params or {}).get("market_max_dist_pct", 1.2))
+    market_max_dist_atr = float((user_params or {}).get("market_max_dist_atr", 0.75))
+    limit_expiry_bars = int((user_params or {}).get("limit_expiry_bars", 5))
+    use_struct = (user_params or {}).get("use_structural_entry", True)
+
+    dist_struct_pct = abs(entry_close - entry_struct) / entry_close * 100 if entry_close else 0.0
+    dist_struct_atr = abs(entry_close - entry_struct) / atr if atr > 0 else 999.0
+    inside_ob = float(ob_bottom) <= last_close <= float(ob_top) * 1.002
+
+    if not use_struct:
+        entry = entry_close
+        entry_mode = "FALLBACK"
+        entry_note = "Structural entry off — pakai close"
+    elif inside_ob or dist_struct_pct <= market_max_dist_pct or dist_struct_atr <= market_max_dist_atr:
+        entry = entry_close
+        entry_mode = "MARKET"
+        entry_note = (
+            f"MARKET @ close (zona OB / dekat OB_Top {entry_struct}, Δ{dist_struct_pct:.1f}%)"
+        )
+    else:
+        # Close di atas OB → LIMIT tunggu retest OB_Top (mitigasi ulang)
+        entry = entry_struct
+        entry_mode = "LIMIT"
+        entry_note = (
+            f"LIMIT @ OB_Top {entry_struct} (bear pra-BOS); "
+            f"expiry {limit_expiry_bars} bar; close {entry_close:.0f} Δ{dist_struct_pct:.1f}%"
+        )
+
+    entry = float(round_to_idx_tick(entry))
+    if entry <= 0:
+        return None
 
     # SL struktural di bawah OB bottom
     stop_struct = float(ob_bottom) * 0.985
@@ -227,9 +260,15 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
     risk_atr = round(risk_per_share / atr, 2) if atr > 0 else 0.0
     risk_pct_out = round(risk_per_share / entry * 100, 2) if entry > 0 else 0.0
 
-    # Base score V4 (tidak ada skor sebelumnya) + MA cross trend profile
+    # Base score V4 + MA cross trend profile
     score = 50
-    reasons = ["OB mitigasi + BOS"]
+    reasons = ["OB mitigasi + BOS", entry_note]
+    if entry_mode == "LIMIT":
+        score += 3  # disiplin tidak chase
+        reasons.append("Entry LIMIT struktural")
+    elif entry_mode == "MARKET" and inside_ob:
+        score += 5
+        reasons.append("Harga di dalam OB")
     if rr_ratio >= 2.5:
         score += 15
         reasons.append(f"RR kuat ({rr_ratio:.1f})")
@@ -259,6 +298,12 @@ def analyze_smc_ticker(symbol: str, user_params: dict = None) -> dict | None:
         "OB_Top": round_to_idx_tick(ob_top),
         "OB_Bottom": round_to_idx_tick(ob_bottom),
         "Entry": entry,
+        "EntryClose": entry_close,
+        "EntryStruct": entry_struct,
+        "EntryMode": entry_mode,
+        "EntryStructNote": entry_note,
+        "EntryExpiryBars": limit_expiry_bars,
+        "DistEntryStructPct": round(dist_struct_pct, 2),
         "StopLoss": stop_loss,
         "SL_Source": sl_source,
         "Target(Liquidity)": target_1,
